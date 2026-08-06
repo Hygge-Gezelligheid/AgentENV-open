@@ -812,10 +812,11 @@ impl FirecrackerSandbox {
         memory_output: OverlaybdCompactOutput,
     ) -> Result<(PathBuf, u64)> {
         let mem_overlaybd_dir = snapshot_dir.join("mem_overlaybd");
-        if ConfigManager::global_config()
-            .memory_snapshot
-            .direct_overlaybd
-        {
+        let config = ConfigManager::global_config();
+        let use_direct_overlaybd =
+            config.memory_snapshot.direct_overlaybd || self.launch.common().track_dirty_pages;
+        // Persisted dirty sandboxes must keep cumulative direct capture after restart.
+        if use_direct_overlaybd {
             let firecracker_pid = self.fc_instance.pid()?;
             self.fc_instance
                 .create_state_only_snapshot(vm_state_path)
@@ -1581,7 +1582,13 @@ impl FirecrackerSandbox {
         // Override the network interface to use the new tap0 in our namespace
         let network_overrides = [("eth0", "tap0")];
         self.fc_instance
-            .load_snapshot_file(&vm_state_src, &mem_device_path, &network_overrides, false)
+            .load_snapshot_file(
+                &vm_state_src,
+                &mem_device_path,
+                &network_overrides,
+                false,
+                config.common.track_dirty_pages,
+            )
             .await?;
 
         let mmds_metadata = self.mmds_metadata(&config.common);
@@ -1679,7 +1686,12 @@ impl FirecrackerSandbox {
         self.configure_logger(&config.common).await?;
 
         self.fc_instance
-            .set_machine_config(config.mem_size_mib, config.vcpu_count, false, false)
+            .set_machine_config(
+                config.mem_size_mib,
+                config.vcpu_count,
+                false,
+                config.common.track_dirty_pages,
+            )
             .await?;
 
         if let Some(cpu_json) = config.common.cpu_config_json.as_deref() {

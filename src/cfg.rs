@@ -415,6 +415,10 @@ pub struct MemorySnapshotConfig {
     pub overlaybd_global_config_path: PathBuf,
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_DIRECT_OVERLAYBD", default = true)]
     pub direct_overlaybd: bool,
+    /// Enable Firecracker KVM dirty-page tracking for memory snapshots.
+    /// Default: false, preserving the mincore-based path.
+    #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = false)]
+    pub track_dirty_pages: bool,
     #[config(default = false)]
     pub compression_enabled: bool,
     #[config(default = "lz4")]
@@ -880,6 +884,7 @@ impl AppConfig {
         if self.ublk.overlaybd.resize_timeout_secs == 0 {
             bail!("invalid ublk.overlaybd config: resize_timeout_secs must be > 0");
         }
+        self.validate_memory_snapshot_options()?;
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
@@ -927,6 +932,25 @@ impl AppConfig {
                     i64::MAX
                 );
             }
+        }
+        Ok(())
+    }
+
+    fn validate_memory_snapshot_options(&self) -> Result<()> {
+        let memory = &self.memory_snapshot;
+        if !memory.track_dirty_pages {
+            return Ok(());
+        }
+        if self.virtualization_mode == VirtualizationMode::Pvm {
+            bail!(
+                "memory_snapshot.track_dirty_pages=true is disabled in PVM mode because this combination has not been tested"
+            );
+        }
+        if !memory.direct_overlaybd {
+            bail!(concat!(
+                "memory_snapshot.track_dirty_pages=true requires ",
+                "memory_snapshot.direct_overlaybd=true for cumulative dirty snapshots"
+            ));
         }
         Ok(())
     }
@@ -1267,19 +1291,23 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn memory_snapshot_compression_config_is_valid() -> Result<()> {
+    fn memory_snapshot_config_defaults_are_valid() -> Result<()> {
         let default = MemorySnapshotConfig::default();
         assert!(!default.compression_enabled);
+        assert!(!default.track_dirty_pages);
         assert_eq!(
             default.compression_algorithm,
             MemorySnapshotCompressionAlgorithm::Lz4
         );
         assert_eq!(default.compression_workers, 1);
-
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         for relative in ["config/default.toml", "config/oss_default.toml"] {
             let config = ConfigManager::new_from_path(&workspace.join(relative))?;
             assert!(!config.config().memory_snapshot.compression_enabled);
+            assert!(
+                !config.config().memory_snapshot.track_dirty_pages,
+                "unexpected track_dirty_pages default in {relative}"
+            );
             assert_eq!(
                 config.config().memory_snapshot.compression_algorithm,
                 MemorySnapshotCompressionAlgorithm::Lz4,
@@ -1291,7 +1319,55 @@ mod tests {
                 "unexpected compression_workers default in {relative}"
             );
         }
+        Ok(())
+    }
 
+    #[test]
+    fn memory_snapshot_track_dirty_pages_validates_supported_combinations() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "virtualization_mode = \"kvm\"\n[memory_snapshot]\ntrack_dirty_pages = true\ndirect_overlaybd = true\n",
+        )?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert!(config.config().memory_snapshot.track_dirty_pages);
+        assert!(config.config().memory_snapshot.direct_overlaybd);
+        assert_eq!(config.config().virtualization_mode, VirtualizationMode::Kvm);
+        std::fs::write(
+            &path,
+            "virtualization_mode = \"kvm\"\n[memory_snapshot]\ntrack_dirty_pages = true\ndirect_overlaybd = false\n",
+        )?;
+        let error = ConfigManager::new_from_path(&path).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "memory_snapshot.track_dirty_pages=true requires memory_snapshot.direct_overlaybd=true"
+            ),
+            "unexpected error: {error}"
+        );
+        std::fs::write(
+            &path,
+            "virtualization_mode = \"pvm\"\n[memory_snapshot]\ntrack_dirty_pages = true\ndirect_overlaybd = true\n",
+        )?;
+        let error = ConfigManager::new_from_path(&path).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "memory_snapshot.track_dirty_pages=true is disabled in PVM mode because this combination has not been tested"
+            ),
+            "unexpected error: {error}"
+        );
+        std::fs::write(
+            &path,
+            "[memory_snapshot]\ntrack_dirty_pages = false\ndirect_overlaybd = false\n",
+        )?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert!(!config.config().memory_snapshot.track_dirty_pages);
+        assert!(!config.config().memory_snapshot.direct_overlaybd);
+        Ok(())
+    }
+
+    #[test]
+    fn memory_snapshot_compression_config_is_valid() -> Result<()> {
         let temp = tempdir()?;
         let path = temp.path().join("config.toml");
         std::fs::write(
@@ -1305,7 +1381,6 @@ mod tests {
             MemorySnapshotCompressionAlgorithm::Zstd
         );
         assert_eq!(config.config().memory_snapshot.compression_workers, 4);
-
         std::fs::write(
             &path,
             "[memory_snapshot]\ncompression_enabled = true\ncompression_algorithm = \"snappy\"\n",
