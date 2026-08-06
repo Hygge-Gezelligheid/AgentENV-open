@@ -127,6 +127,10 @@ pub struct FirecrackerCommonConfig {
     /// is enabled and written to a `firecracker.log` file alongside the stdout log.
     pub firecracker_log_level: Option<String>,
     pub runtime_policy: FirecrackerRuntimePolicy,
+    /// Enable Firecracker KVM dirty-page tracking for memory snapshot capture.
+    /// The serde default keeps older persisted snapshot configs compatible.
+    #[serde(default)]
+    pub track_dirty_pages: bool,
     pub envd_version: String,
     /// Control plane port inside the VM (default: 49983).
     pub control_plane_port: u16,
@@ -167,6 +171,7 @@ impl FirecrackerCommonConfig {
             stderr_path: None,
             firecracker_log_level: None,
             runtime_policy,
+            track_dirty_pages: false,
             envd_version: EnvdConfig::default().version,
             control_plane_port: ToolsConfig::default().control_plane_port,
             env_vars: None,
@@ -191,6 +196,7 @@ impl FirecrackerCommonConfig {
 
         let mut common = Self::new(firecracker_binary, tools_drive_version, runtime_policy);
         common.envd_version = config.envd.version.clone();
+        common.track_dirty_pages = config.memory_snapshot.track_dirty_pages;
         common.rootfs_allow_shrink = config.ublk.overlaybd.allow_shrink;
         common.control_plane_port = config.tools.control_plane_port;
         common.firecracker_work_base_dir = config.firecracker.work_dir.clone();
@@ -716,6 +722,16 @@ mod tests {
 
         let common_config = FirecrackerCommonConfig::from_app_config(&config)?;
         assert!(common_config.ublk_config.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn from_app_config_maps_track_dirty_pages() -> Result<()> {
+        let mut config = base_app_config();
+        config.memory_snapshot.track_dirty_pages = true;
+
+        let common_config = FirecrackerCommonConfig::from_app_config(&config)?;
+        assert!(common_config.track_dirty_pages);
         Ok(())
     }
 
