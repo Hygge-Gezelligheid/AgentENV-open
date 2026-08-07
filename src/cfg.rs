@@ -409,8 +409,6 @@ pub enum MemorySnapshotCompressionAlgorithm {
 pub struct MemorySnapshotConfig {
     #[config(default = "$AENV_HOME/overlaybd/mem-overlaybd-global.json")]
     pub overlaybd_global_config_path: PathBuf,
-    #[config(env = "AGENTENV_MEMORY_SNAPSHOT_DIRECT_OVERLAYBD", default = true)]
-    pub direct_overlaybd: bool,
     /// Enable Firecracker KVM dirty-page tracking for memory snapshots.
     /// Default: false, preserving the mincore-based path.
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = false)]
@@ -942,12 +940,6 @@ impl AppConfig {
                 "memory_snapshot.track_dirty_pages=true is disabled in PVM mode because this combination has not been tested"
             );
         }
-        if !memory.direct_overlaybd {
-            bail!(concat!(
-                "memory_snapshot.track_dirty_pages=true requires ",
-                "memory_snapshot.direct_overlaybd=true for cumulative dirty snapshots"
-            ));
-        }
         Ok(())
     }
 
@@ -1296,28 +1288,20 @@ mod tests {
     #[test]
     fn validate_memory_snapshot_options_enforces_dirty_page_requirements() {
         let cases = [
-            (VirtualizationMode::Kvm, false, false, None),
-            (VirtualizationMode::Kvm, true, true, None),
-            (
-                VirtualizationMode::Kvm,
-                true,
-                false,
-                Some("requires memory_snapshot.direct_overlaybd=true"),
-            ),
+            (VirtualizationMode::Kvm, false, None),
+            (VirtualizationMode::Kvm, true, None),
             (
                 VirtualizationMode::Pvm,
-                true,
                 true,
                 Some("is disabled in PVM mode"),
             ),
         ];
 
-        for (virtualization_mode, track_dirty_pages, direct_overlaybd, expected_error) in cases {
+        for (virtualization_mode, track_dirty_pages, expected_error) in cases {
             let config = AppConfig {
                 virtualization_mode,
                 memory_snapshot: MemorySnapshotConfig {
                     track_dirty_pages,
-                    direct_overlaybd,
                     ..Default::default()
                 },
                 ..Default::default()

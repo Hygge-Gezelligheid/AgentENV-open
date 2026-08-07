@@ -297,14 +297,9 @@ fill_concurrency = 4
 # Generated OverlayBD config dedicated to memory snapshot devices.
 # overlaybd_global_config_path = "$AENV_HOME/overlaybd/mem-overlaybd-global.json"
 
-# EXPERIMENTAL: create memory layers directly from Firecracker dirty ranges via
-# process_vm_readv, skipping sparse mem.bin. Override with
-# AGENTENV_MEMORY_SNAPSHOT_DIRECT_OVERLAYBD.
-direct_overlaybd = true
-
 # EXPERIMENTAL: use Firecracker KVM dirty-page tracking instead of mincore.
-# Requires direct_overlaybd = true and is disabled for PVM. Override with
-# AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES.
+# It is disabled for PVM. Memory snapshot packaging always uses the direct
+# OverlayBD path. Override with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES.
 track_dirty_pages = false
 
 # Compress memory snapshot layers. The algorithm is parsed but ignored when
