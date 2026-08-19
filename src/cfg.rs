@@ -890,6 +890,13 @@ impl AppConfig {
         }
 
         self.p2p.store_dir = resolve_path(&self.home_path, config_dir, &self.p2p.store_dir);
+
+        // Dirty-page tracking is a KVM-only default. Disable it before
+        // validation so an existing PVM configuration needs no new override.
+        if self.virtualization_mode == VirtualizationMode::Pvm {
+            self.memory_snapshot.track_dirty_pages = false;
+        }
+
         self.cluster.normalize();
         self.sandbox_proxy.normalize()?;
 
@@ -1333,6 +1340,18 @@ mod tests {
     fn bundled_default_config_loads() -> Result<()> {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn pvm_config_disables_dirty_page_tracking() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("pvm.toml");
+        std::fs::write(&path, "virtualization_mode = \"pvm\"")?;
+
+        let config = ConfigManager::new_from_path(&path)?;
+        assert_eq!(config.config().virtualization_mode, VirtualizationMode::Pvm);
+        assert!(!config.config().memory_snapshot.track_dirty_pages);
         Ok(())
     }
 

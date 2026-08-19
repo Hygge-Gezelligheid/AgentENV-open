@@ -307,7 +307,7 @@ fill_concurrency = 4
 # overlaybd_global_config_path = "$AENV_HOME/overlaybd/mem-overlaybd-global.json"
 
 # EXPERIMENTAL: use Firecracker KVM dirty-page tracking instead of mincore.
-# It is disabled for PVM. Memory snapshot packaging always uses the direct
+# It is automatically disabled for PVM. Memory snapshot packaging always uses the direct
 # OverlayBD path. Disable with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false.
 track_dirty_pages = true
 

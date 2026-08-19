@@ -229,7 +229,7 @@ virtualization_mode = "pvm"
 
 The environment variable takes precedence over the TOML value.
 
-Memory snapshot dirty-page tracking (`memory_snapshot.track_dirty_pages = true`) is temporarily disabled in PVM mode because this combination has not been tested.
+Memory snapshot dirty-page tracking is enabled by default for KVM and automatically disabled in PVM mode because this combination has not been tested.
 
 To build a PVM Docker image:
 
