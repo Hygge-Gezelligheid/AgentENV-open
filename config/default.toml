@@ -308,8 +308,8 @@ fill_concurrency = 4
 
 # EXPERIMENTAL: use Firecracker KVM dirty-page tracking instead of mincore.
 # It is disabled for PVM. Memory snapshot packaging always uses the direct
-# OverlayBD path. Override with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES.
-track_dirty_pages = false
+# OverlayBD path. Disable with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false.
+track_dirty_pages = true
 
 # Compress memory snapshot layers. The algorithm is parsed but ignored when
 # compression is disabled.
