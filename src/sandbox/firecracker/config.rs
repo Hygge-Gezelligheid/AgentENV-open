@@ -183,7 +183,7 @@ impl FirecrackerCommonConfig {
             stderr_path: None,
             firecracker_log_level: None,
             runtime_policy,
-            track_dirty_pages: false,
+            track_dirty_pages: true,
             envd_version: EnvdConfig::default().version,
             control_plane_port: ToolsConfig::default().control_plane_port,
             env_vars: None,

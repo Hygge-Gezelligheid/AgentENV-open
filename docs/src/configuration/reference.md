@@ -516,7 +516,7 @@ the default path on every startup.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
-| `track_dirty_pages` | bool | `false` | Enable Firecracker KVM dirty-page tracking for memory snapshots. It defaults to false. The option is temporarily disabled in PVM mode because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=true` to enable it. |
+| `track_dirty_pages` | bool | `true` | Enable Firecracker KVM dirty-page tracking for memory snapshots. The option is temporarily disabled in PVM mode because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false` to disable it. |
 | `compression_enabled` | bool | `false` | Enable compression for memory snapshot layers. When disabled, `compression_algorithm` is still parsed but has no effect. This setting affects only memory layers; the physical file name remains `overlaybd.commit`. |
 | `compression_algorithm` | string | `"lz4"` | Compression algorithm for memory snapshot layers. Valid values are only `lz4` and `zstd`. |
 
