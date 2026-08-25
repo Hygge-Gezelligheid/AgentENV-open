@@ -600,6 +600,31 @@ mod tests {
     }
 
     #[test]
+    fn working_set_allows_non_contiguous_ranges_when_they_are_not_coalescible() -> Result<()> {
+        let working_set = GuestMemoryWorkingSet::new(vec![
+            GuestMemoryRange {
+                gpa: 0,
+                size: GUEST_MEMORY_PAGE_SIZE,
+            },
+            // The one-page gap means these ranges are not GPA-contiguous and
+            // therefore must remain separate rather than being rejected.
+            GuestMemoryRange {
+                gpa: 2 * GUEST_MEMORY_PAGE_SIZE,
+                size: GUEST_MEMORY_PAGE_SIZE,
+            },
+        ]);
+        let regions = [GuestMemoryRegion {
+            base_host_virt_addr: 0x1000_0000,
+            guest_phys_addr: 0,
+            size: 3 * GUEST_MEMORY_PAGE_SIZE,
+            page_size: GUEST_MEMORY_PAGE_SIZE,
+        }];
+        working_set.validate_shape()?;
+        working_set.validate_for_regions(&regions, working_set_limits())?;
+        Ok(())
+    }
+
+    #[test]
     fn working_set_accepts_empty_and_rejects_holes_and_budgets() -> Result<()> {
         let empty = GuestMemoryWorkingSet::new(vec![]);
         empty.validate_for_regions(&regions_with_mmio_hole(), working_set_limits())?;

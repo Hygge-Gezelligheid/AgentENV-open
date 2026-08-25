@@ -55,6 +55,12 @@ impl FirecrackerInstance {
         }
     }
 
+    #[cfg(test)]
+    /// Path of the Firecracker API socket for crate-internal lifecycle tests.
+    pub(crate) fn api_socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
     pub fn pid(&self) -> Result<Pid> {
         let raw_pid = self
             .process

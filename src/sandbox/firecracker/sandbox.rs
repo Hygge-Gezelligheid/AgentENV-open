@@ -32,7 +32,7 @@ use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
 
-use crate::cfg::ConfigManager;
+use crate::cfg::{AppConfig, ConfigManager};
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
     CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
@@ -1356,7 +1356,11 @@ impl FirecrackerSandbox {
     /// Best-effort KVM pre-fault. Metadata/API/capability failure is a
     /// performance-hint failure only; the caller always proceeds to resume.
     async fn try_prefault_restore(&self) {
-        let config = ConfigManager::global_config();
+        self.try_prefault_restore_with_config(ConfigManager::global_config())
+            .await;
+    }
+
+    async fn try_prefault_restore_with_config(&self, config: &AppConfig) {
         if !config.restore_prefault.enabled {
             return;
         }
@@ -2152,6 +2156,15 @@ mod tests {
     use crate::sandbox::{SandboxAccessTokenGenerator, SandboxExecutor};
     use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotRecord};
     use std::collections::HashMap;
+    use std::convert::Infallible;
+
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::{Bytes, Incoming};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Method, Request, Response, StatusCode};
+    use hyper_util::rt::TokioIo;
+    use tokio::net::UnixListener;
 
     fn fresh_config() -> FirecrackerSandboxConfig {
         FirecrackerSandboxConfig::new(
@@ -2168,6 +2181,12 @@ mod tests {
             "overlaybd-image.json".into(),
             false,
         ));
+        config
+    }
+
+    fn prefault_enabled_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.restore_prefault.enabled = true;
         config
     }
 
@@ -2688,6 +2707,133 @@ mod tests {
             LaunchMode::Resume(config) => assert!(!config.common.track_dirty_pages),
             LaunchMode::Fresh(_) => panic!("profiler must resume a snapshot"),
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_prefault_uses_gpa_regions_before_sending_ranges() -> Result<()> {
+        let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
+        sandbox.restore_working_set = Some(GuestMemoryWorkingSet::new(vec![
+            super::super::manifest::GuestMemoryRange {
+                gpa: 4 * 1024 * 1024 * 1024,
+                size: 4096,
+            },
+        ]));
+        let listener = UnixListener::bind(sandbox.fc_instance.api_socket_path())?;
+
+        let server = tokio::spawn(async move {
+            for expected_path in ["/vm/guest-memory-regions", "/vm/pre-fault-memory"] {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept fake Firecracker request");
+                http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |request: Request<Incoming>| async move {
+                            assert_eq!(request.uri().path(), expected_path);
+                            let (status, body) = match expected_path {
+                                "/vm/guest-memory-regions" => {
+                                    assert_eq!(request.method(), Method::GET);
+                                    (
+                                        StatusCode::OK,
+                                        r#"[{"base_host_virt_addr":0,"guest_phys_addr":4294967296,"size":8192,"offset":0,"page_size":4096}]"#,
+                                    )
+                                }
+                                "/vm/pre-fault-memory" => {
+                                    assert_eq!(request.method(), Method::PUT);
+                                    let body = request
+                                        .collect()
+                                        .await
+                                        .expect("collect pre-fault request")
+                                        .to_bytes();
+                                    let request: serde_json::Value =
+                                        serde_json::from_slice(&body).expect("decode pre-fault request");
+                                    assert_eq!(
+                                        request,
+                                        serde_json::json!({"ranges": [{"gpa": 4294967296_i64, "size": 4096_i64}]}),
+                                    );
+                                    (StatusCode::NO_CONTENT, "")
+                                }
+                                _ => unreachable!(),
+                            };
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(status)
+                                    .body(Full::new(Bytes::from(body)))
+                                    .expect("build fake Firecracker response"),
+                            )
+                        }),
+                    )
+                    .await
+                    .expect("serve fake Firecracker request");
+            }
+        });
+
+        sandbox
+            .try_prefault_restore_with_config(&prefault_enabled_config())
+            .await;
+        server.await.expect("join fake Firecracker server");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_prefault_endpoint_failure_and_empty_metadata_are_non_blocking() -> Result<()> {
+        let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
+        sandbox.restore_working_set = Some(GuestMemoryWorkingSet::new(vec![
+            super::super::manifest::GuestMemoryRange { gpa: 0, size: 4096 },
+        ]));
+        let listener = UnixListener::bind(sandbox.fc_instance.api_socket_path())?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("accept guest-memory-regions request");
+            http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(|request: Request<Incoming>| async move {
+                        assert_eq!(request.uri().path(), "/vm/guest-memory-regions");
+                        assert_eq!(request.method(), Method::GET);
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(Full::new(Bytes::new()))
+                                .expect("build unavailable response"),
+                        )
+                    }),
+                )
+                .await
+                .expect("serve unavailable response");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "endpoint failure must not send a pre-fault request"
+            );
+        });
+
+        sandbox
+            .try_prefault_restore_with_config(&prefault_enabled_config())
+            .await;
+        server
+            .await
+            .expect("join unavailable fake Firecracker server");
+
+        let mut empty_sandbox = FirecrackerSandbox::new(fresh_config())?;
+        empty_sandbox.restore_working_set = Some(GuestMemoryWorkingSet::new(Vec::new()));
+        let listener = UnixListener::bind(empty_sandbox.fc_instance.api_socket_path())?;
+        empty_sandbox
+            .try_prefault_restore_with_config(&prefault_enabled_config())
+            .await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "empty metadata must not call any Firecracker pre-fault API"
+        );
         Ok(())
     }
 }
