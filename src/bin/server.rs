@@ -78,6 +78,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     agentenv::privileges::require_runtime_capabilities()?;
+    if config.template_profiling.uses_idle_page_tracking() {
+        agentenv::privileges::require_idle_page_tracking_capabilities()?;
+        warn!(
+            "idle-page profiling was explicitly selected; it requires CAP_DAC_OVERRIDE and is not enabled by the default service capability set"
+        );
+    }
     agentenv::privileges::clear_ambient_capabilities()?;
 
     let api_key = ApiKey::resolve(config)?;

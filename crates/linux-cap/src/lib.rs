@@ -3,6 +3,7 @@ use std::io;
 
 pub const CAP_NET_ADMIN: i32 = 12;
 pub const CAP_SYS_ADMIN: i32 = 21;
+pub const CAP_DAC_OVERRIDE: i32 = 1;
 
 const PR_CAP_AMBIENT: libc::c_int = 47;
 const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;
@@ -219,5 +220,10 @@ mod tests {
         assert!(sets.is_delegable(CAP_NET_ADMIN).unwrap());
         assert!(!sets.is_delegable(CAP_SYS_ADMIN).unwrap());
         assert!(sets.effective(CAP_SYS_ADMIN).unwrap());
+    }
+    #[test]
+    fn cap_dac_override_uses_linux_capability_number_one() {
+        assert_eq!(CAP_DAC_OVERRIDE, 1);
+        assert_eq!(capability_masks(&[CAP_DAC_OVERRIDE]).unwrap(), [0b10, 0]);
     }
 }

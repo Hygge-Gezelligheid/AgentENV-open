@@ -137,6 +137,10 @@ pub struct AppConfig {
     pub network: NetworkConfig,
     #[config(nested)]
     pub custom_extension: CustomExtensionConfig,
+    #[config(nested)]
+    pub template_profiling: TemplateProfilingConfig,
+    #[config(nested)]
+    pub restore_prefault: RestorePrefaultConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Config)]
@@ -344,6 +348,40 @@ pub struct SnapshotConfig {
 
 #[derive(Debug, Config, Clone)]
 pub struct SnapshotImagePublishConfig {
+    #[config(default = false)]
+    pub enabled: bool,
+}
+
+/// Configuration for the optional pre-publication template profiling pass.
+/// Mincore residency is the default and is collected by Firecracker itself.
+/// Linux idle-page tracking is retained as an explicit opt-in fallback.
+#[derive(Debug, Config, Clone)]
+pub struct TemplateProfilingConfig {
+    #[config(default = false)]
+    pub enabled: bool,
+    #[config(default = "mincore")]
+    pub tracker: String,
+    #[config(default = 268_435_456u64)]
+    pub max_prefault_bytes: u64,
+    #[config(default = 4096usize)]
+    pub max_range_count: usize,
+    #[config(default = 50u8)]
+    pub max_guest_memory_ratio_percent: u8,
+}
+
+impl TemplateProfilingConfig {
+    pub fn uses_idle_page_tracking(&self) -> bool {
+        self.enabled && self.tracker == "idle-page"
+    }
+
+    pub fn uses_mincore(&self) -> bool {
+        self.enabled && self.tracker == "mincore"
+    }
+}
+
+/// Configuration for optional restore-time KVM pre-fault.
+#[derive(Debug, Config, Clone)]
+pub struct RestorePrefaultConfig {
     #[config(default = false)]
     pub enabled: bool,
 }
@@ -1341,6 +1379,25 @@ mod tests {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
         Ok(())
+    }
+
+    #[test]
+    fn template_profiling_defaults_to_disabled_mincore_and_idle_is_explicit() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.template_profiling.tracker, "mincore");
+        assert!(!config.template_profiling.enabled);
+        assert!(!config.template_profiling.uses_mincore());
+        assert!(!config.template_profiling.uses_idle_page_tracking());
+        assert!(!config.restore_prefault.enabled);
+
+        config.template_profiling.enabled = true;
+        assert!(config.template_profiling.uses_mincore());
+        config.template_profiling.tracker = "idle-page".to_string();
+        assert!(!config.template_profiling.uses_mincore());
+        assert!(config.template_profiling.uses_idle_page_tracking());
+        config.template_profiling.tracker = "unknown".to_string();
+        assert!(!config.template_profiling.uses_mincore());
+        assert!(!config.template_profiling.uses_idle_page_tracking());
     }
 
     #[test]

@@ -358,3 +358,20 @@ node_id = "node-a"
 cluster_id = "00000000-0000-0000-0000-000000000000"
 # Identifier for this service instance.
 service_instance_id = "service-instance-a"
+
+# Optional pre-publication working-set profiling. Mincore residency is the
+# default collector; Linux idle-page tracking is an explicitly selected legacy
+# mode because it needs an additional capability that is not part of deployment.
+[template_profiling]
+enabled = false
+tracker = "mincore"
+# Refuse (rather than truncate) a working set over either this byte budget,
+# this range count, or this percentage of guest RAM.
+max_prefault_bytes = 268435456
+max_range_count = 4096
+max_guest_memory_ratio_percent = 50
+
+# Restore-time KVM pre-fault is independent from profiling, so deployments may
+# first collect working-set metadata without consuming it.
+[restore_prefault]
+enabled = false

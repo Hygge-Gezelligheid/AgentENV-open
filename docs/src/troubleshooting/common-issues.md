@@ -88,4 +88,19 @@ API_ADDR=0.0.0.0:8001 make start-server
 
 Also check `[envd].init_timeout_secs` in your config. The default is 60 seconds. If the rootfs image is large, the in-guest envd daemon may need more time to initialize.
 
+## Idle-page template profiling is unavailable
+
+**Symptom**: The server reports that explicitly selected idle-page profiling is
+unavailable after `[template_profiling] tracker = "idle-page"`.
+
+**Solution**: This optional performance feature needs `CAP_SYS_ADMIN` to read
+unmasked pagemap PFNs and `CAP_DAC_OVERRIDE` to open the root-only
+`/sys/kernel/mm/page_idle/bitmap`. The default service intentionally does not
+grant this capability; use the default `tracker = "mincore"` unless an operator
+has deliberately provisioned an isolated idle-page deployment.
+
+Both trackers require a compatible Firecracker with guest physical RAM regions
+(`guest_phys_addr`); restore pre-fault additionally needs
+`PUT /vm/pre-fault-memory`. When unavailable, AgentENV safely resumes normally.
+
 > TODO: Expand with more common issues as they are reported.

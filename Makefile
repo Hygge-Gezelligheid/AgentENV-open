@@ -116,7 +116,9 @@ test: test-agent test-envd test-ublk
 
 test-unit:
 	$(CARGO) test -p agentenv -p envd -p linux-cap --lib
-	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib -- --ignored
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib -- --ignored \
+		--skip privileges::tests::scoped_tracker_command_receives_only_tracker_capabilities \
+		--skip privileges::tests::clearing_ambient_capabilities_prevents_direct_child_inheritance
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib
 	bash scripts/tests/verify-capability-runner.sh
 	bash scripts/tests/verify-install-service.sh

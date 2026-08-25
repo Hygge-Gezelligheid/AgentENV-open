@@ -5,10 +5,11 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use tracing::warn;
 
-pub use linux_cap::{CAP_NET_ADMIN, CAP_SYS_ADMIN};
+pub use linux_cap::{CAP_DAC_OVERRIDE, CAP_NET_ADMIN, CAP_SYS_ADMIN};
 
 fn capability_name(capability: i32) -> &'static str {
     match capability {
+        CAP_DAC_OVERRIDE => "CAP_DAC_OVERRIDE",
         CAP_NET_ADMIN => "CAP_NET_ADMIN",
         CAP_SYS_ADMIN => "CAP_SYS_ADMIN",
         _ => "unknown capability",
@@ -21,10 +22,32 @@ fn capability_name(capability: i32) -> &'static str {
 /// processes receive only their required capability through the ambient set
 /// immediately before `exec`.
 pub fn require_runtime_capabilities() -> Result<()> {
+    require_capabilities(
+        &[CAP_NET_ADMIN, CAP_SYS_ADMIN],
+        "AENV runtime",
+        "Start it with CAP_NET_ADMIN and CAP_SYS_ADMIN in the inheritable, permitted, and effective sets (the installed systemd unit configures this automatically)",
+    )
+}
+
+/// Validate the additional capability contract needed only while profiling
+/// template memory through Linux page-idle tracking.
+///
+/// The default service intentionally does not retain CAP_DAC_OVERRIDE. This
+/// check is reached only when the operator explicitly selects the idle tracker.
+pub fn require_idle_page_tracking_capabilities() -> Result<()> {
+    require_capabilities(
+        &[CAP_SYS_ADMIN, CAP_DAC_OVERRIDE],
+        "idle-page tracking",
+        "Enable CAP_SYS_ADMIN and CAP_DAC_OVERRIDE in the inheritable, permitted, and effective sets only for an explicit [template_profiling] tracker = \"idle-page\" deployment. The default mincore tracker does not require CAP_DAC_OVERRIDE.",
+    )
+}
+
+fn require_capabilities(capabilities: &[i32], subject: &str, remediation: &str) -> Result<()> {
     let sets = linux_cap::CapabilitySets::current().context("read process capability sets")?;
     let is_root = nix::unistd::Uid::effective().is_root();
-    let missing = [CAP_NET_ADMIN, CAP_SYS_ADMIN]
-        .into_iter()
+    let missing = capabilities
+        .iter()
+        .copied()
         .filter(|capability| {
             if is_root {
                 !sets.effective(*capability).unwrap_or(false)
@@ -37,8 +60,8 @@ pub fn require_runtime_capabilities() -> Result<()> {
 
     if !missing.is_empty() {
         bail!(
-            "AENV runtime is missing required Linux capabilities: {}. Start it with CAP_NET_ADMIN and CAP_SYS_ADMIN in the inheritable, permitted, and effective sets (the installed systemd unit configures this automatically)",
-            missing.join(", ")
+            "{subject} is missing required Linux capabilities: {}. {remediation}",
+            missing.join(", "),
         );
     }
     Ok(())
@@ -180,6 +203,32 @@ mod tests {
         }
     }
 
+    fn assert_direct_child_has_no_effective_or_ambient_capabilities(status: &str) {
+        for field in ["CapEff:", "CapAmb:"] {
+            assert_eq!(
+                status_field(status, field),
+                "0000000000000000",
+                "direct child retained {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_name_includes_dac_override() {
+        assert_eq!(capability_name(CAP_DAC_OVERRIDE), "CAP_DAC_OVERRIDE");
+    }
+
+    #[test]
+    fn idle_page_tracking_capability_error_is_actionable() {
+        let error = run_with_scoped_capabilities(&[], require_idle_page_tracking_capabilities)
+            .expect_err("an empty capability scope must not satisfy idle-page tracking");
+        let message = error.to_string();
+        assert!(message.contains("idle-page tracking is missing required Linux capabilities"));
+        assert!(message.contains("CAP_SYS_ADMIN"));
+        assert!(message.contains("CAP_DAC_OVERRIDE"));
+        assert!(message.contains("template_profiling"));
+    }
+
     #[test]
     fn parses_capability_sets() {
         let status =
@@ -269,6 +318,34 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN and CAP_DAC_OVERRIDE to delegate tracker capabilities"]
+    fn scoped_tracker_command_receives_only_tracker_capabilities() -> Result<()> {
+        anyhow::ensure!(
+            linux_cap::has_effective_capabilities(&[CAP_SYS_ADMIN, CAP_DAC_OVERRIDE])?,
+            "test requires CAP_SYS_ADMIN and CAP_DAC_OVERRIDE"
+        );
+
+        let caller_capabilities = current_capability_status()?;
+        let output = run_with_scoped_capabilities(&[CAP_SYS_ADMIN, CAP_DAC_OVERRIDE], || {
+            Ok(Command::new("sh")
+                .args(["-c", "cat /proc/thread-self/status"])
+                .output()?)
+        })?;
+        let status = String::from_utf8(output.stdout)?;
+
+        assert!(output.status.success());
+        for field in CAPABILITY_STATUS_FIELDS {
+            assert_eq!(
+                status_field(&status, field),
+                "0000000000200002",
+                "child received an unexpected {field} value"
+            );
+        }
+        assert_eq!(current_capability_status()?, caller_capabilities);
+        Ok(())
+    }
+
     #[tokio::test]
     #[ignore = "requires CAP_SYS_ADMIN to create and enter a network namespace"]
     async fn scoped_spawn_enters_netns_and_drops_capabilities() -> Result<()> {
@@ -309,6 +386,24 @@ mod tests {
         assert_child_has_no_capabilities(child_status);
         assert_eq!(fs::read_link("/proc/thread-self/ns/net")?, caller_namespace);
         assert_eq!(current_capability_status()?, caller_capabilities);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an ambient capability runner; this mutates the test process ambient set"]
+    fn clearing_ambient_capabilities_prevents_direct_child_inheritance() -> Result<()> {
+        anyhow::ensure!(
+            linux_cap::has_effective_capabilities(&[CAP_DAC_OVERRIDE])?,
+            "test requires CAP_DAC_OVERRIDE"
+        );
+        clear_ambient_capabilities()?;
+        let status = String::from_utf8(
+            Command::new("sh")
+                .args(["-c", "cat /proc/thread-self/status"])
+                .output()?
+                .stdout,
+        )?;
+        assert_direct_child_has_no_effective_or_ambient_capabilities(&status);
         Ok(())
     }
 }
