@@ -19,7 +19,7 @@ use super::config::{
 use super::manifest::{
     FirecrackerSnapshotManifest, GuestMemoryWorkingSet, GuestMemoryWorkingSetLimits,
 };
-use super::mincore_tracking::resident_ranges_to_working_set;
+use super::mincore_tracking::{resident_ranges_to_working_set, ResidentMemoryRange};
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
@@ -93,6 +93,106 @@ fn warn_if_mincore_host_has_swap() {
             "cannot determine host swap state; mincore profiling continues, but its working-set completeness cannot be assessed"
         ),
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResidentRangeStats {
+    range_count: usize,
+    bytes: u64,
+}
+
+fn normalized_resident_ranges(ranges: &[ResidentMemoryRange]) -> Result<Vec<ResidentMemoryRange>> {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_by_key(|range| range.image_offset);
+    let mut normalized: Vec<ResidentMemoryRange> = Vec::with_capacity(sorted.len());
+    for range in sorted {
+        let range_end = range
+            .image_offset
+            .checked_add(range.length)
+            .context("resident range end overflows u64")?;
+        if let Some(previous) = normalized.last_mut() {
+            let previous_end = previous
+                .image_offset
+                .checked_add(previous.length)
+                .context("resident range end overflows u64")?;
+            if range.image_offset <= previous_end {
+                if range_end > previous_end {
+                    previous.length = range_end - previous.image_offset;
+                }
+                continue;
+            }
+        }
+        normalized.push(range);
+    }
+    Ok(normalized)
+}
+
+fn resident_range_stats(ranges: &[ResidentMemoryRange]) -> Result<ResidentRangeStats> {
+    let ranges = normalized_resident_ranges(ranges)?;
+    let bytes = ranges.iter().try_fold(0_u64, |total, range| {
+        total
+            .checked_add(range.length)
+            .context("resident range byte total overflows u64")
+    })?;
+    Ok(ResidentRangeStats {
+        range_count: ranges.len(),
+        bytes,
+    })
+}
+
+fn newly_resident_range_stats(
+    baseline: &[ResidentMemoryRange],
+    final_ranges: &[ResidentMemoryRange],
+) -> Result<ResidentRangeStats> {
+    let baseline = normalized_resident_ranges(baseline)?;
+    let final_ranges = normalized_resident_ranges(final_ranges)?;
+    let mut baseline_index = 0;
+    let mut range_count = 0;
+    let mut bytes = 0_u64;
+
+    for final_range in final_ranges {
+        let final_end = final_range
+            .image_offset
+            .checked_add(final_range.length)
+            .context("final resident range end overflows u64")?;
+        let mut cursor = final_range.image_offset;
+        while baseline_index < baseline.len() {
+            let baseline_end = baseline[baseline_index]
+                .image_offset
+                .checked_add(baseline[baseline_index].length)
+                .context("baseline resident range end overflows u64")?;
+            if baseline_end > cursor {
+                break;
+            }
+            baseline_index += 1;
+        }
+        let mut index = baseline_index;
+        while index < baseline.len() && baseline[index].image_offset < final_end {
+            if baseline[index].image_offset > cursor {
+                let end = baseline[index].image_offset.min(final_end);
+                bytes = bytes
+                    .checked_add(end - cursor)
+                    .context("newly resident byte total overflows u64")?;
+                range_count += 1;
+            }
+            let baseline_end = baseline[index]
+                .image_offset
+                .checked_add(baseline[index].length)
+                .context("baseline resident range end overflows u64")?;
+            cursor = cursor.max(baseline_end);
+            if cursor >= final_end {
+                break;
+            }
+            index += 1;
+        }
+        if cursor < final_end {
+            bytes = bytes
+                .checked_add(final_end - cursor)
+                .context("newly resident byte total overflows u64")?;
+            range_count += 1;
+        }
+    }
+    Ok(ResidentRangeStats { range_count, bytes })
 }
 
 fn bandwidth_bucket(
@@ -645,6 +745,14 @@ impl FirecrackerSandbox {
         }
     }
 
+    async fn start_profiling_paused(&mut self) -> Result<()> {
+        self.launch.validate()?;
+        let LaunchMode::Resume(config) = &self.launch else {
+            bail!("profiling requires a snapshot-resume launch");
+        };
+        self.start_resume_with_options(config.clone(), false).await
+    }
+
     /// Wait for the sandbox to be fully ready.
     ///
     /// This should be called after `start_nowait()` if you want to interact with the sandbox.
@@ -920,8 +1028,9 @@ impl FirecrackerSandbox {
         Ok(sandbox)
     }
 
-    /// Resume a dedicated throwaway profiler, wait through the normal envd
-    /// ready/init boundary, pause it, and harvest Firecracker mincore ranges.
+    /// Load a dedicated throwaway profiler paused, collect its baseline, then
+    /// resume through the normal envd ready/init boundary, pause it, and
+    /// harvest the final Firecracker mincore ranges.
     /// The profiler owns an exclusive memory UBLK device and never releases its
     /// memory background download notification.
     pub(crate) async fn profile_snapshot_working_set(
@@ -931,16 +1040,27 @@ impl FirecrackerSandbox {
         warn_if_mincore_host_has_swap();
         let mut profiler = Self::from_profiling_snapshot_config(snapshot)?;
         let result = async {
-            profiler.start().await?;
+            profiler.start_profiling_paused().await?;
+            let baseline = profiler.fc_instance.get_resident_memory_ranges().await?;
+            let baseline_stats = resident_range_stats(&baseline)?;
+            profiler.fc_instance.resume().await?;
+            profiler.wait_for_ready().await?;
             profiler.fc_instance.pause().await?;
             let resident = profiler.fc_instance.get_resident_memory_ranges().await?;
+            let final_stats = resident_range_stats(&resident)?;
+            let newly_resident_stats = newly_resident_range_stats(&baseline, &resident)?;
             let regions = profiler
                 .fc_instance
                 .get_guest_memory_image_regions()
                 .await?;
             let working_set = resident_ranges_to_working_set(&resident, &regions, limits)?;
             debug!(
-                final_ranges = resident.len(),
+                baseline_ranges = baseline_stats.range_count,
+                baseline_bytes = baseline_stats.bytes,
+                final_ranges = final_stats.range_count,
+                final_bytes = final_stats.bytes,
+                newly_resident_ranges = newly_resident_stats.range_count,
+                newly_resident_bytes = newly_resident_stats.bytes,
                 coalesced_ranges = working_set.ranges.len(),
                 working_set_bytes = working_set.total_bytes()?,
                 "collected mincore profiling working set"
@@ -1531,6 +1651,15 @@ impl FirecrackerSandbox {
 
     #[tracing::instrument(skip(self, config))]
     async fn start_resume(&mut self, config: FirecrackerSnapshotConfig) -> Result<()> {
+        self.start_resume_with_options(config, true).await
+    }
+
+    #[tracing::instrument(skip(self, config))]
+    async fn start_resume_with_options(
+        &mut self,
+        config: FirecrackerSnapshotConfig,
+        resume_vm: bool,
+    ) -> Result<()> {
         // NOTE: The virtio-balloon device is NOT configured here. Balloon state
         // is part of vm_state.bin and is restored automatically by Firecracker.
         // Snapshots taken before balloon support was added will simply not have
@@ -1765,11 +1894,13 @@ impl FirecrackerSandbox {
             .await
             .context("reconcile disk rate limiter on snapshot resume")?;
 
-        self.try_prefault_restore().await;
-
-        self.fc_instance.resume().await?;
-
-        debug!("sandbox restored from snapshot config");
+        if resume_vm {
+            self.try_prefault_restore().await;
+            self.fc_instance.resume().await?;
+            debug!("sandbox restored from snapshot config");
+        } else {
+            debug!("snapshot loaded paused for dedicated profiling");
+        }
         Ok(())
     }
 
@@ -2145,6 +2276,57 @@ mod tests {
             4096
         );
         assert!(mincore_swap_total_kib("MemTotal: 1024 kB\n").is_err());
+    }
+
+    #[test]
+    fn resident_range_stats_distinguish_baseline_final_and_newly_resident_bytes() -> Result<()> {
+        let baseline = [
+            ResidentMemoryRange {
+                image_offset: 0,
+                length: 100,
+            },
+            ResidentMemoryRange {
+                image_offset: 300,
+                length: 100,
+            },
+        ];
+        let final_ranges = [
+            ResidentMemoryRange {
+                image_offset: 0,
+                length: 200,
+            },
+            ResidentMemoryRange {
+                image_offset: 300,
+                length: 100,
+            },
+            ResidentMemoryRange {
+                image_offset: 500,
+                length: 50,
+            },
+        ];
+
+        assert_eq!(
+            resident_range_stats(&baseline)?,
+            ResidentRangeStats {
+                range_count: 2,
+                bytes: 200,
+            }
+        );
+        assert_eq!(
+            resident_range_stats(&final_ranges)?,
+            ResidentRangeStats {
+                range_count: 3,
+                bytes: 350,
+            }
+        );
+        assert_eq!(
+            newly_resident_range_stats(&baseline, &final_ranges)?,
+            ResidentRangeStats {
+                range_count: 2,
+                bytes: 150,
+            }
+        );
+        Ok(())
     }
 
     #[test]
