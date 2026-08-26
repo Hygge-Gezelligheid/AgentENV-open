@@ -11,17 +11,18 @@
 use crate::models;
 use serde::{Deserialize, Serialize};
 
+/// PreFaultMemoryRange : Guest-physical memory range to pre-fault.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Error {
-    /// A description of the error condition
-    #[serde(rename = "fault_message", skip_serializing_if = "Option::is_none")]
-    pub fault_message: Option<String>,
+pub struct PreFaultMemoryRange {
+    #[serde(rename = "gpa")]
+    pub gpa: i64,
+    #[serde(rename = "size")]
+    pub size: i64,
 }
 
-impl Error {
-    pub fn new() -> Error {
-        Error {
-            fault_message: None,
-        }
+impl PreFaultMemoryRange {
+    /// Guest-physical memory range to pre-fault.
+    pub fn new(gpa: i64, size: i64) -> PreFaultMemoryRange {
+        PreFaultMemoryRange { gpa, size }
     }
 }

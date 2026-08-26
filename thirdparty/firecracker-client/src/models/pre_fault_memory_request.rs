@@ -11,17 +11,16 @@
 use crate::models;
 use serde::{Deserialize, Serialize};
 
+/// PreFaultMemoryRequest : Non-empty guest-physical ranges to pre-fault on a paused microVM.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Error {
-    /// A description of the error condition
-    #[serde(rename = "fault_message", skip_serializing_if = "Option::is_none")]
-    pub fault_message: Option<String>,
+pub struct PreFaultMemoryRequest {
+    #[serde(rename = "ranges")]
+    pub ranges: Vec<models::PreFaultMemoryRange>,
 }
 
-impl Error {
-    pub fn new() -> Error {
-        Error {
-            fault_message: None,
-        }
+impl PreFaultMemoryRequest {
+    /// Non-empty guest-physical ranges to pre-fault on a paused microVM.
+    pub fn new(ranges: Vec<models::PreFaultMemoryRange>) -> PreFaultMemoryRequest {
+        PreFaultMemoryRequest { ranges }
     }
 }
