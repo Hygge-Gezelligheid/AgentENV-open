@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
 use nix::libc;
@@ -65,28 +65,34 @@ const USER_ROOTFS_DRIVE_PATH: &str = "user-rootfs";
 /// makes the configured `*_per_sec` values equal the sustained per-second rate.
 const RATE_LIMIT_REFILL_TIME_MS: i64 = 1000;
 
-/// Mincore omits swapped-out pages. Do not publish incomplete residency
-/// metadata when the profiling host has swap enabled; changing host swap is
-/// intentionally outside AgentENV's authority.
-fn ensure_mincore_host_has_no_swap() -> Result<()> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo")
-        .context("read /proc/meminfo for mincore profiling swap gate")?;
-    ensure_mincore_meminfo_has_no_swap(&meminfo)
-}
-
-fn ensure_mincore_meminfo_has_no_swap(meminfo: &str) -> Result<()> {
-    let swap_kib = meminfo
+/// Read configured host swap for profiling observability. Swap may reduce the
+/// observed mincore working set, but it must not prevent snapshot publication
+/// or restore.
+fn mincore_swap_total_kib(meminfo: &str) -> Result<u64> {
+    meminfo
         .lines()
         .find_map(|line| line.strip_prefix("SwapTotal:"))
         .and_then(|value| value.split_whitespace().next())
         .ok_or_else(|| anyhow::anyhow!("/proc/meminfo does not contain SwapTotal"))?
         .parse::<u64>()
-        .context("parse SwapTotal from /proc/meminfo")?;
-    ensure!(
-        swap_kib == 0,
-        "skip mincore working-set metadata: host swap is enabled ({swap_kib} KiB)"
-    );
-    Ok(())
+        .context("parse SwapTotal from /proc/meminfo")
+}
+
+fn warn_if_mincore_host_has_swap() {
+    match std::fs::read_to_string("/proc/meminfo")
+        .context("read /proc/meminfo for mincore profiling swap observation")
+        .and_then(|meminfo| mincore_swap_total_kib(&meminfo))
+    {
+        Ok(0) => {}
+        Ok(swap_kib) => warn!(
+            swap_kib,
+            "mincore profiling continues with host swap enabled; actual swapped guest-memory pages can make the recorded working set incomplete and reduce restore pre-fault benefit"
+        ),
+        Err(error) => warn!(
+            error = ?error,
+            "cannot determine host swap state; mincore profiling continues, but its working-set completeness cannot be assessed"
+        ),
+    }
 }
 
 fn bandwidth_bucket(
@@ -922,7 +928,7 @@ impl FirecrackerSandbox {
         snapshot: &FirecrackerSnapshotConfig,
         limits: GuestMemoryWorkingSetLimits,
     ) -> Result<GuestMemoryWorkingSet> {
-        ensure_mincore_host_has_no_swap()?;
+        warn_if_mincore_host_has_swap();
         let mut profiler = Self::from_profiling_snapshot_config(snapshot)?;
         let result = async {
             profiler.start().await?;
@@ -2129,15 +2135,16 @@ mod tests {
     }
 
     #[test]
-    fn mincore_swap_gate_requires_zero_swap_total() {
-        ensure_mincore_meminfo_has_no_swap("MemTotal: 1024 kB\nSwapTotal: 0 kB\n")
-            .expect("swap disabled must allow mincore profiling");
-        let error = ensure_mincore_meminfo_has_no_swap("SwapTotal: 4096 kB\n")
-            .expect_err("swap enabled must suppress mincore metadata");
-        assert!(error
-            .to_string()
-            .contains("host swap is enabled (4096 KiB)"));
-        assert!(ensure_mincore_meminfo_has_no_swap("MemTotal: 1024 kB\n").is_err());
+    fn mincore_swap_total_is_observational_not_a_gate() {
+        assert_eq!(
+            mincore_swap_total_kib("MemTotal: 1024 kB\nSwapTotal: 0 kB\n").unwrap(),
+            0
+        );
+        assert_eq!(
+            mincore_swap_total_kib("SwapTotal: 4096 kB\n").unwrap(),
+            4096
+        );
+        assert!(mincore_swap_total_kib("MemTotal: 1024 kB\n").is_err());
     }
 
     #[test]
