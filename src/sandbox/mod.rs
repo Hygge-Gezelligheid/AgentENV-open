@@ -33,7 +33,8 @@ pub use firecracker::{
     FirecrackerCapturedSnapshot, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
     FirecrackerSandboxFactory, FirecrackerSnapshotConfig, FirecrackerSnapshotManifest,
-    GuestMemoryWorkingSetLimits, SnapshotMincoreStage,
+    GuestMemoryWorkingSet, GuestMemoryWorkingSetLimits, SnapshotMincoreStage,
+    SnapshotPrefaultCandidate,
 };
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
 pub use network::{

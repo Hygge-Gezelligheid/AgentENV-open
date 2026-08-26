@@ -24,8 +24,11 @@ pub use config::{
 };
 pub use factory::FirecrackerSandboxFactory;
 pub(super) use instance::FirecrackerInstance;
-pub use manifest::{FirecrackerSnapshotManifest, GuestMemoryWorkingSetLimits};
+pub use manifest::{
+    FirecrackerSnapshotManifest, GuestMemoryWorkingSet, GuestMemoryWorkingSetLimits,
+};
 pub use pool::FirecrackerPool;
 pub use sandbox::{
     FirecrackerCapturedSnapshot, FirecrackerPausedState, FirecrackerSandbox, SnapshotMincoreStage,
+    SnapshotPrefaultCandidate,
 };

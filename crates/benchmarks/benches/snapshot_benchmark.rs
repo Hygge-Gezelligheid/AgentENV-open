@@ -1,7 +1,9 @@
+use agentenv::cfg::ConfigManager;
 use agentenv::image::ImageResolver;
 use agentenv::sandbox::{
-    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotConfig, OverlaybdConfig,
-    SandboxExecutor, UblkDeviceManager,
+    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotConfig,
+    GuestMemoryWorkingSetLimits, OverlaybdConfig, SandboxExecutor, SnapshotPrefaultCandidate,
+    UblkDeviceManager,
 };
 use anyhow::{Context, Result};
 use criterion::Criterion;
@@ -12,7 +14,7 @@ use std::sync::{
     Arc, Barrier,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::OnceCell;
 
@@ -69,6 +71,8 @@ fn filtered_benchmark_names() -> Result<Option<Vec<String>>> {
         println!("snapshot_resume");
         println!("concurrent_resume");
         println!("snapshot_mincore_stages");
+        println!("snapshot_prefault_e2e");
+        println!("snapshot_prefault_phase_e2e");
         return Ok(None);
     }
 
@@ -472,6 +476,197 @@ fn bench_snapshot_concurrent_resume(c: &mut Criterion) {
     });
 }
 
+const PREFAULT_ARM_ORDER: [bool; 4] = [false, true, true, false];
+
+fn prefault_working_set_limits() -> GuestMemoryWorkingSetLimits {
+    let profiling = &ConfigManager::global_config().template_profiling;
+    GuestMemoryWorkingSetLimits {
+        max_bytes: profiling.max_prefault_bytes,
+        max_ranges: profiling.max_range_count,
+        max_guest_memory_ratio_percent: profiling.max_guest_memory_ratio_percent,
+    }
+}
+
+async fn prepare_profiled_snapshot() -> Result<(FirecrackerSnapshotConfig, usize, u64)> {
+    let mut snapshot = prepare_snapshot().await?;
+    let working_set =
+        FirecrackerSandbox::profile_snapshot_working_set(&snapshot, prefault_working_set_limits())
+            .await
+            .context("profile benchmark snapshot working set")?;
+    let range_count = working_set.ranges.len();
+    let byte_count = working_set
+        .total_bytes()
+        .context("sum benchmark working-set bytes")?;
+    anyhow::ensure!(
+        range_count > 0 && byte_count > 0,
+        "profiled benchmark snapshot has an empty working set"
+    );
+    snapshot.restore_working_set = Some(working_set);
+    Ok((snapshot, range_count, byte_count))
+}
+
+async fn resume_to_guest_ready(
+    snapshot: &FirecrackerSnapshotConfig,
+    prefault_enabled: bool,
+) -> Result<Duration> {
+    let started = Instant::now();
+    let mut sandbox =
+        FirecrackerSandbox::resume_from_snapshot_config_with_prefault(snapshot, prefault_enabled)
+            .await
+            .context("resume snapshot")?;
+    let ready_result = sandbox
+        .executor()?
+        .run_command("true", &[])
+        .await
+        .context("wait for guest command readiness");
+    let elapsed = started.elapsed();
+    let stop_result = sandbox.stop().await;
+
+    ready_result?;
+    stop_result.context("stop measured sandbox")?;
+    Ok(elapsed)
+}
+
+async fn prefault_e2e_samples(
+    snapshot: &FirecrackerSnapshotConfig,
+    hot: bool,
+    prefault_enabled: bool,
+) -> Result<Vec<Duration>> {
+    let mut warm_sandbox = if hot {
+        let sandbox = FirecrackerSandbox::resume_from_snapshot_config_with_prefault(
+            snapshot,
+            prefault_enabled,
+        )
+        .await
+        .context("start hot-path holder")?;
+        sandbox
+            .executor()?
+            .run_command("true", &[])
+            .await
+            .context("wait for hot-path holder readiness")?;
+        Some(sandbox)
+    } else {
+        None
+    };
+
+    let result = async {
+        let mut samples = Vec::with_capacity(DEFAULT_SAMPLE_COUNT);
+        for _ in 0..DEFAULT_SAMPLE_COUNT {
+            samples.push(resume_to_guest_ready(snapshot, prefault_enabled).await?);
+            tokio::time::sleep(cleanup_settle_time()).await;
+        }
+        Ok(samples)
+    }
+    .await;
+
+    if let Some(mut sandbox) = warm_sandbox.take() {
+        sandbox.stop().await.context("stop hot-path holder")?;
+    }
+    result
+}
+
+fn run_prefault_e2e_benchmark(rt: &Runtime) -> Result<()> {
+    let (snapshot, range_count, byte_count) = rt.block_on(prepare_profiled_snapshot())?;
+    println!(
+        "prefault_e2e invariant: one profiled snapshot; working-set ranges {range_count}, bytes {byte_count}; only the in-process pre-fault boolean differs between arms"
+    );
+
+    for (mode, hot) in [("cold", false), ("hot", true)] {
+        for (run, enabled) in PREFAULT_ARM_ORDER.into_iter().enumerate() {
+            let samples = rt.block_on(prefault_e2e_samples(&snapshot, hot, enabled))?;
+            let arm = if enabled { "enabled" } else { "disabled" };
+            print_samples(
+                &format!("prefault_e2e_{mode}_{arm}_run{}", run + 1),
+                &samples,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct PrefaultPhaseArm {
+    name: &'static str,
+    snapshot: FirecrackerSnapshotConfig,
+    prefault_enabled: bool,
+    range_count: usize,
+    byte_count: u64,
+}
+
+fn prefault_phase_arm(
+    snapshot: &FirecrackerSnapshotConfig,
+    candidate: SnapshotPrefaultCandidate,
+) -> Result<PrefaultPhaseArm> {
+    let range_count = candidate.working_set.ranges.len();
+    let byte_count = candidate
+        .working_set
+        .total_bytes()
+        .context("sum phase pre-fault candidate bytes")?;
+    anyhow::ensure!(
+        range_count > 0 && byte_count > 0,
+        "empty {} pre-fault candidate",
+        candidate.phase
+    );
+    let mut snapshot = snapshot.clone();
+    snapshot.restore_working_set = Some(candidate.working_set);
+    Ok(PrefaultPhaseArm {
+        name: candidate.phase,
+        snapshot,
+        prefault_enabled: true,
+        range_count,
+        byte_count,
+    })
+}
+
+async fn prepare_prefault_phase_arms() -> Result<Vec<PrefaultPhaseArm>> {
+    let snapshot = prepare_snapshot().await?;
+    let mut arms = vec![PrefaultPhaseArm {
+        name: "none",
+        snapshot: snapshot.clone(),
+        prefault_enabled: false,
+        range_count: 0,
+        byte_count: 0,
+    }];
+    for candidate in FirecrackerSandbox::profile_snapshot_prefault_candidates(
+        &snapshot,
+        prefault_working_set_limits(),
+    )
+    .await
+    .context("profile phase pre-fault candidates")?
+    {
+        arms.push(prefault_phase_arm(&snapshot, candidate)?);
+    }
+    Ok(arms)
+}
+
+fn run_prefault_phase_e2e_benchmark(rt: &Runtime) -> Result<()> {
+    let arms = rt.block_on(prepare_prefault_phase_arms())?;
+    anyhow::ensure!(
+        arms.len() == 4,
+        "expected no-prefault plus three phase candidates"
+    );
+    for arm in &arms {
+        println!(
+            "prefault_phase candidate={} ranges={} bytes={}",
+            arm.name, arm.range_count, arm.byte_count
+        );
+    }
+    let order = [3usize, 2, 1, 0, 0, 1, 2, 3];
+    for (run, index) in order.into_iter().enumerate() {
+        let arm = &arms[index];
+        let samples = rt.block_on(prefault_e2e_samples(
+            &arm.snapshot,
+            false,
+            arm.prefault_enabled,
+        ))?;
+        print_samples(
+            &format!("prefault_phase_cold_{}_run{}", arm.name, run + 1),
+            &samples,
+        );
+    }
+    Ok(())
+}
+
 fn criterion_config() -> Criterion {
     if full_bench_mode() {
         Criterion::default()
@@ -670,6 +865,14 @@ fn run_default_snapshot_benchmarks() -> Result<()> {
     ran |= run_default_benchmark("concurrent_resume", &filters, || {
         default_concurrent_resume(&rt)
     });
+    if should_run("snapshot_prefault_e2e", &filters) {
+        run_prefault_e2e_benchmark(&rt)?;
+        ran = true;
+    }
+    if should_run("snapshot_prefault_phase_e2e", &filters) {
+        run_prefault_phase_e2e_benchmark(&rt)?;
+        ran = true;
+    }
 
     if should_run("snapshot_mincore_stages", &filters) {
         run_mincore_stage_diagnostic(&rt)?;
