@@ -38,7 +38,8 @@ At restore, AgentENV loads the snapshot paused, validates the optional
 working-set metadata against the restored guest-memory regions and configured
 limits, calls Firecracker's KVM pre-fault API for valid ranges, then resumes
 the guest. The metadata is a performance hint: a snapshot without it, invalid
-metadata, or an unavailable pre-fault API resumes normally.
+metadata, or an HTTP pre-fault API rejection resumes normally. A Firecracker
+socket/transport failure remains a restore error.
 
 ## Limits and operational notes
 

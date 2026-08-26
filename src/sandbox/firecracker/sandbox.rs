@@ -27,6 +27,7 @@ use super::overlaybd_snapshot::{
 };
 use super::pool::{warm_stderr_path, warm_stdout_path, FirecrackerPool};
 use super::prefault::{build_prefault_plan, PrefaultPlan};
+use super::socket::is_http_status_error;
 use super::FirecrackerInstance;
 use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
@@ -1414,24 +1415,24 @@ impl FirecrackerSandbox {
         })
     }
 
-    /// Best-effort KVM pre-fault. Metadata/API/capability failure is a
-    /// performance-hint failure only; the caller always proceeds to resume.
-    async fn try_prefault_restore(&self) {
+    /// Apply a KVM pre-fault performance hint. API status failures are
+    /// non-blocking, but a Firecracker transport failure still blocks a resume.
+    async fn try_prefault_restore(&self) -> Result<()> {
         self.try_prefault_restore_with_config(ConfigManager::global_config())
-            .await;
+            .await
     }
 
-    async fn try_prefault_restore_with_config(&self, config: &AppConfig) {
+    async fn try_prefault_restore_with_config(&self, config: &AppConfig) -> Result<()> {
         if !config.restore_prefault.enabled {
-            return;
+            return Ok(());
         }
         let Some(working_set) = self.restore_working_set.as_ref() else {
             debug!("skip restore pre-fault: snapshot has no working-set metadata");
-            return;
+            return Ok(());
         };
         if working_set.ranges.is_empty() {
             debug!("skip restore pre-fault: snapshot working-set is empty");
-            return;
+            return Ok(());
         }
         let limits = GuestMemoryWorkingSetLimits {
             max_bytes: config.template_profiling.max_prefault_bytes,
@@ -1442,10 +1443,11 @@ impl FirecrackerSandbox {
         };
         let regions = match self.fc_instance.get_guest_memory_regions().await {
             Ok(regions) => regions,
-            Err(error) => {
+            Err(error) if is_http_status_error(&error) => {
                 warn!(error = ?error, "skip restore pre-fault: guest-memory-regions unavailable");
-                return;
+                return Ok(());
             }
+            Err(error) => return Err(error.context("get guest-memory regions before pre-fault")),
         };
         match build_prefault_plan(
             true,
@@ -1460,13 +1462,15 @@ impl FirecrackerSandbox {
                     Ok(()) => {
                         debug!(range_count = ranges.len(), bytes, elapsed = ?started.elapsed(), "restore pre-fault applied before resume")
                     }
-                    Err(error) => {
+                    Err(error) if is_http_status_error(&error) => {
                         warn!(error = ?error, range_count = ranges.len(), bytes, "restore pre-fault failed; resuming normally")
                     }
+                    Err(error) => return Err(error.context("pre-fault guest memory before resume")),
                 }
             }
             PrefaultPlan::Skip(reason) => debug!(?reason, "skip restore pre-fault"),
         }
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, config))]
@@ -1895,7 +1899,7 @@ impl FirecrackerSandbox {
             .context("reconcile disk rate limiter on snapshot resume")?;
 
         if resume_vm {
-            self.try_prefault_restore().await;
+            self.try_prefault_restore().await?;
             self.fc_instance.resume().await?;
             debug!("sandbox restored from snapshot config");
         } else {
@@ -2825,7 +2829,7 @@ mod tests {
                                     assert_eq!(request.method(), Method::GET);
                                     (
                                         StatusCode::OK,
-                                        r#"[{"base_host_virt_addr":0,"guest_phys_addr":4294967296,"size":8192,"offset":0,"page_size":4096}]"#,
+                                        r#"[{"base_host_virt_addr":0,"guest_phys_addr":0,"size":4096,"offset":0,"page_size":4096},{"base_host_virt_addr":4096,"guest_phys_addr":4294967296,"size":8192,"offset":4096,"page_size":4096}]"#,
                                     )
                                 }
                                 "/vm/pre-fault-memory" => {
@@ -2860,7 +2864,7 @@ mod tests {
 
         sandbox
             .try_prefault_restore_with_config(&prefault_enabled_config())
-            .await;
+            .await?;
         server.await.expect("join fake Firecracker server");
         Ok(())
     }
@@ -2904,7 +2908,7 @@ mod tests {
 
         sandbox
             .try_prefault_restore_with_config(&prefault_enabled_config())
-            .await;
+            .await?;
         server
             .await
             .expect("join unavailable fake Firecracker server");
@@ -2914,12 +2918,32 @@ mod tests {
         let listener = UnixListener::bind(empty_sandbox.fc_instance.api_socket_path())?;
         empty_sandbox
             .try_prefault_restore_with_config(&prefault_enabled_config())
-            .await;
+            .await?;
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
                 .await
                 .is_err(),
             "empty metadata must not call any Firecracker pre-fault API"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_prefault_transport_failure_blocks_resume() -> Result<()> {
+        let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
+        sandbox.restore_working_set = Some(GuestMemoryWorkingSet::new(vec![
+            super::super::manifest::GuestMemoryRange { gpa: 0, size: 4096 },
+        ]));
+
+        let error = sandbox
+            .try_prefault_restore_with_config(&prefault_enabled_config())
+            .await
+            .expect_err("missing Firecracker socket must block resume");
+        assert!(
+            error
+                .to_string()
+                .contains("get guest-memory regions before pre-fault"),
+            "unexpected transport error: {error:#}"
         );
         Ok(())
     }

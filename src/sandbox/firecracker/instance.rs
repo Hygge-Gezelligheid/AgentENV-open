@@ -486,17 +486,30 @@ impl FirecrackerInstance {
     /// Returns the guest-RAM layout for restore-time metadata validation.
     #[tracing::instrument(skip(self))]
     pub async fn get_guest_memory_regions(&self) -> Result<Vec<GuestMemoryRegion>> {
-        Ok(self
-            .get_guest_memory_image_regions()
-            .await?
+        let regions = self
+            .client
+            .request::<(), Vec<firecracker_client::models::GuestRegionUffdMapping>>(
+                Method::GET,
+                "/vm/guest-memory-regions",
+                None,
+            )
+            .await
+            .context("Failed to get guest-memory regions")?;
+        regions
             .into_iter()
-            .map(|region| GuestMemoryRegion {
-                base_host_virt_addr: 0,
-                guest_phys_addr: region.guest_phys_addr,
-                size: region.size,
-                page_size: region.page_size,
+            .map(|region| {
+                Ok(GuestMemoryRegion {
+                    base_host_virt_addr: u64::try_from(region.base_host_virt_addr)
+                        .context("Firecracker returned a negative guest-memory host address")?,
+                    guest_phys_addr: u64::try_from(region.guest_phys_addr)
+                        .context("Firecracker returned a negative guest physical address")?,
+                    size: u64::try_from(region.size)
+                        .context("Firecracker returned a negative guest-memory region size")?,
+                    page_size: u64::try_from(region.page_size)
+                        .context("Firecracker returned a negative guest-memory page size")?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Returns Firecracker's snapshot-image-to-GPA map for mincore harvesting.
@@ -764,6 +777,7 @@ mod tests {
         let server = tokio::spawn(async move {
             for expected_path in [
                 "/vm/guest-memory-regions",
+                "/vm/guest-memory-regions",
                 "/vm/dirty-memory-ranges",
                 "/vm/pre-fault-memory",
             ] {
@@ -782,7 +796,7 @@ mod tests {
                                     assert_eq!(request.method(), Method::GET);
                                     (
                                         StatusCode::OK,
-                                        r#"[{"base_host_virt_addr":0,"guest_phys_addr":4294967296,"size":4096,"offset":4096,"page_size":4096}]"#,
+                                        r#"[{"base_host_virt_addr":8192,"guest_phys_addr":4294967296,"size":4096,"offset":4096,"page_size":4096}]"#,
                                     )
                                 }
                                 "/vm/dirty-memory-ranges" => {
@@ -821,6 +835,9 @@ mod tests {
                     .expect("serve fake Firecracker request");
             }
         });
+
+        let restore_regions = instance.get_guest_memory_regions().await?;
+        assert_eq!(restore_regions[0].base_host_virt_addr, 8192);
 
         let regions = instance.get_guest_memory_image_regions().await?;
         assert_eq!(regions.len(), 1);
