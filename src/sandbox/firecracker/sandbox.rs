@@ -141,15 +141,14 @@ fn resident_range_stats(ranges: &[ResidentMemoryRange]) -> Result<ResidentRangeS
     })
 }
 
-fn newly_resident_range_stats(
+fn newly_resident_ranges(
     baseline: &[ResidentMemoryRange],
     final_ranges: &[ResidentMemoryRange],
-) -> Result<ResidentRangeStats> {
+) -> Result<Vec<ResidentMemoryRange>> {
     let baseline = normalized_resident_ranges(baseline)?;
     let final_ranges = normalized_resident_ranges(final_ranges)?;
     let mut baseline_index = 0;
-    let mut range_count = 0;
-    let mut bytes = 0_u64;
+    let mut newly_resident = Vec::new();
 
     for final_range in final_ranges {
         let final_end = final_range
@@ -171,10 +170,10 @@ fn newly_resident_range_stats(
         while index < baseline.len() && baseline[index].image_offset < final_end {
             if baseline[index].image_offset > cursor {
                 let end = baseline[index].image_offset.min(final_end);
-                bytes = bytes
-                    .checked_add(end - cursor)
-                    .context("newly resident byte total overflows u64")?;
-                range_count += 1;
+                newly_resident.push(ResidentMemoryRange {
+                    image_offset: cursor,
+                    length: end - cursor,
+                });
             }
             let baseline_end = baseline[index]
                 .image_offset
@@ -187,13 +186,13 @@ fn newly_resident_range_stats(
             index += 1;
         }
         if cursor < final_end {
-            bytes = bytes
-                .checked_add(final_end - cursor)
-                .context("newly resident byte total overflows u64")?;
-            range_count += 1;
+            newly_resident.push(ResidentMemoryRange {
+                image_offset: cursor,
+                length: final_end - cursor,
+            });
         }
     }
-    Ok(ResidentRangeStats { range_count, bytes })
+    Ok(newly_resident)
 }
 
 fn bandwidth_bucket(
@@ -1049,12 +1048,13 @@ impl FirecrackerSandbox {
             profiler.fc_instance.pause().await?;
             let resident = profiler.fc_instance.get_resident_memory_ranges().await?;
             let final_stats = resident_range_stats(&resident)?;
-            let newly_resident_stats = newly_resident_range_stats(&baseline, &resident)?;
+            let newly_resident = newly_resident_ranges(&baseline, &resident)?;
+            let newly_resident_stats = resident_range_stats(&newly_resident)?;
             let regions = profiler
                 .fc_instance
                 .get_guest_memory_image_regions()
                 .await?;
-            let working_set = resident_ranges_to_working_set(&resident, &regions, limits)?;
+            let working_set = resident_ranges_to_working_set(&newly_resident, &regions, limits)?;
             debug!(
                 baseline_ranges = baseline_stats.range_count,
                 baseline_bytes = baseline_stats.bytes,
@@ -2323,8 +2323,22 @@ mod tests {
                 bytes: 350,
             }
         );
+        let newly_resident = newly_resident_ranges(&baseline, &final_ranges)?;
         assert_eq!(
-            newly_resident_range_stats(&baseline, &final_ranges)?,
+            newly_resident,
+            vec![
+                ResidentMemoryRange {
+                    image_offset: 100,
+                    length: 100,
+                },
+                ResidentMemoryRange {
+                    image_offset: 500,
+                    length: 50,
+                },
+            ]
+        );
+        assert_eq!(
+            resident_range_stats(&newly_resident)?,
             ResidentRangeStats {
                 range_count: 2,
                 bytes: 150,
