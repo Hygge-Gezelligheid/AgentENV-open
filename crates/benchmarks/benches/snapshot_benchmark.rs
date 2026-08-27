@@ -68,6 +68,7 @@ fn filtered_benchmark_names() -> Result<Option<Vec<String>>> {
         println!("snapshot_resume_cold");
         println!("snapshot_resume");
         println!("concurrent_resume");
+        println!("snapshot_mincore_stages");
         return Ok(None);
     }
 
@@ -269,6 +270,40 @@ async fn prepare_snapshot() -> Result<agentenv::sandbox::FirecrackerSnapshotConf
     let snapshot = sandbox.pause().await?;
     sandbox.stop().await?;
     Ok(snapshot)
+}
+
+async fn run_mincore_stage_workload(sandbox: &FirecrackerSandbox) -> Result<()> {
+    let output = sandbox
+        .executor()?
+        .run_command("sh", &["-lc", "sha256sum /etc/os-release >/dev/null"])
+        .await
+        .context("run mincore diagnostic workload")?;
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "mincore diagnostic workload failed with exit code {}: {}",
+        output.exit_code,
+        output.stderr
+    );
+    Ok(())
+}
+
+fn run_mincore_stage_diagnostic(rt: &Runtime) -> Result<()> {
+    let snapshot = rt.block_on(prepare_snapshot())?;
+    let stages = rt.block_on(FirecrackerSandbox::profile_snapshot_mincore_stages(
+        &snapshot,
+        |sandbox| Box::pin(run_mincore_stage_workload(sandbox)),
+    ))?;
+    for stage in stages {
+        println!(
+            "mincore_stage phase={} total_ranges={} total_bytes={} delta_ranges={} delta_bytes={}",
+            stage.phase,
+            stage.total_ranges,
+            stage.total_bytes,
+            stage.newly_resident_ranges,
+            stage.newly_resident_bytes,
+        );
+    }
+    Ok(())
 }
 
 fn bench_snapshot_resume(c: &mut Criterion) {
@@ -635,6 +670,11 @@ fn run_default_snapshot_benchmarks() -> Result<()> {
     ran |= run_default_benchmark("concurrent_resume", &filters, || {
         default_concurrent_resume(&rt)
     });
+
+    if should_run("snapshot_mincore_stages", &filters) {
+        run_mincore_stage_diagnostic(&rt)?;
+        ran = true;
+    }
 
     if !ran {
         eprintln!(

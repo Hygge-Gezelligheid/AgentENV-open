@@ -1,5 +1,7 @@
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -100,6 +102,39 @@ fn warn_if_mincore_host_has_swap() {
 struct ResidentRangeStats {
     range_count: usize,
     bytes: u64,
+}
+
+/// One mincore sample from the dedicated snapshot profiler.
+///
+/// newly_resident_* is the set difference from the preceding sample. The
+/// first snapshot_loaded_paused sample therefore reports zero new bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotMincoreStage {
+    pub phase: &'static str,
+    pub total_ranges: usize,
+    pub total_bytes: u64,
+    pub newly_resident_ranges: usize,
+    pub newly_resident_bytes: u64,
+}
+
+fn snapshot_mincore_stage(
+    phase: &'static str,
+    previous: Option<&[ResidentMemoryRange]>,
+    current: &[ResidentMemoryRange],
+) -> Result<SnapshotMincoreStage> {
+    let total = resident_range_stats(current)?;
+    let newly_resident = match previous {
+        Some(previous) => newly_resident_ranges(previous, current)?,
+        None => Vec::new(),
+    };
+    let newly = resident_range_stats(&newly_resident)?;
+    Ok(SnapshotMincoreStage {
+        phase,
+        total_ranges: total.range_count,
+        total_bytes: total.bytes,
+        newly_resident_ranges: newly.range_count,
+        newly_resident_bytes: newly.bytes,
+    })
 }
 
 fn normalized_resident_ranges(ranges: &[ResidentMemoryRange]) -> Result<Vec<ResidentMemoryRange>> {
@@ -753,11 +788,7 @@ impl FirecrackerSandbox {
         self.start_resume_with_options(config.clone(), false).await
     }
 
-    /// Wait for the sandbox to be fully ready.
-    ///
-    /// This should be called after `start_nowait()` if you want to interact with the sandbox.
-    #[tracing::instrument(skip(self))]
-    pub(crate) async fn wait_for_ready(&self) -> Result<()> {
+    async fn wait_for_envd_ready(&self) -> Result<()> {
         let Some(envd_instance) = self.envd_instance.as_ref() else {
             return Err(anyhow::anyhow!("envd instance not initialized"));
         };
@@ -766,11 +797,14 @@ impl FirecrackerSandbox {
                 self.runtime_policy.envd_timeout,
                 self.runtime_policy.envd_poll_interval,
             )
-            .await?;
+            .await
+    }
+
+    async fn release_background_downloads_after_envd_ready(&self) {
         if !self.profiling_mode {
             if let Some(device_key) = &self.mem_snapshot_image_config_path {
                 // envd is up: release held background downloads for this memory
-                // device. Best-effort — downloads would also start after the
+                // device. Best-effort - downloads would also start after the
                 // fallback timeout.
                 UblkDeviceManager::global()
                     .notify_sandbox_ready(device_key)
@@ -783,6 +817,12 @@ impl FirecrackerSandbox {
                 .notify_sandbox_ready(device_key)
                 .await;
         }
+    }
+
+    async fn initialize_envd(&self) -> Result<()> {
+        let Some(envd_instance) = self.envd_instance.as_ref() else {
+            return Err(anyhow::anyhow!("envd instance not initialized"));
+        };
         envd_instance
             .init(
                 self.launch.common().env_vars.clone(),
@@ -790,6 +830,16 @@ impl FirecrackerSandbox {
                 self.launch.common().default_user.clone(),
             )
             .await
+    }
+
+    /// Wait for the sandbox to be fully ready.
+    ///
+    /// This should be called after start_nowait if you want to interact with the sandbox.
+    #[tracing::instrument(skip(self))]
+    pub(crate) async fn wait_for_ready(&self) -> Result<()> {
+        self.wait_for_envd_ready().await?;
+        self.release_background_downloads_after_envd_ready().await;
+        self.initialize_envd().await
     }
 
     /// Pause the running sandbox and create a snapshot for later resume.
@@ -1026,6 +1076,89 @@ impl FirecrackerSandbox {
         let mut sandbox = Self::from_snapshot_config(snapshot)?;
         sandbox.start().await?;
         Ok(sandbox)
+    }
+
+    async fn collect_mincore_stage(
+        &self,
+        phase: &'static str,
+        previous: &mut Option<Vec<ResidentMemoryRange>>,
+    ) -> Result<SnapshotMincoreStage> {
+        let current = self.fc_instance.get_resident_memory_ranges().await?;
+        let stage = snapshot_mincore_stage(phase, previous.as_deref(), &current)?;
+        *previous = Some(current);
+        Ok(stage)
+    }
+
+    /// Profile mincore at each restore boundary on one dedicated profiler VM.
+    ///
+    /// This diagnostic records pages after snapshot load, resume, envd readiness,
+    /// envd initialization, and the supplied first workload. It does not update
+    /// snapshot metadata or issue pre-fault requests.
+    pub async fn profile_snapshot_mincore_stages<F>(
+        snapshot: &FirecrackerSnapshotConfig,
+        workload: F,
+    ) -> Result<Vec<SnapshotMincoreStage>>
+    where
+        F: for<'a> FnOnce(&'a Self) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>,
+    {
+        warn_if_mincore_host_has_swap();
+        let mut profiler = Self::from_profiling_snapshot_config(snapshot)?;
+        let result = async {
+            let mut previous = None;
+            let mut stages = Vec::with_capacity(5);
+
+            profiler.start_profiling_paused().await?;
+            stages.push(
+                profiler
+                    .collect_mincore_stage("snapshot_loaded_paused", &mut previous)
+                    .await?,
+            );
+
+            profiler.fc_instance.resume().await?;
+            stages.push(
+                profiler
+                    .collect_mincore_stage("firecracker_resumed", &mut previous)
+                    .await?,
+            );
+
+            profiler.wait_for_envd_ready().await?;
+            stages.push(
+                profiler
+                    .collect_mincore_stage("envd_ready", &mut previous)
+                    .await?,
+            );
+
+            profiler
+                .release_background_downloads_after_envd_ready()
+                .await;
+            profiler.initialize_envd().await?;
+            stages.push(
+                profiler
+                    .collect_mincore_stage("envd_initialized", &mut previous)
+                    .await?,
+            );
+
+            workload(&profiler)
+                .await
+                .context("run first workload during mincore profiling")?;
+            stages.push(
+                profiler
+                    .collect_mincore_stage("first_workload_complete", &mut previous)
+                    .await?,
+            );
+
+            Ok(stages)
+        }
+        .await;
+        let stop_result = profiler.stop().await;
+        match (result, stop_result) {
+            (Ok(stages), Ok(())) => Ok(stages),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error.context("stop dedicated profiling sandbox")),
+            (Err(run_error), Err(stop_error)) => Err(anyhow::anyhow!(
+                "mincore stage profiling failed: {run_error:#}; additionally failed to stop profiler: {stop_error:#}"
+            )),
+        }
     }
 
     /// Load a dedicated throwaway profiler paused, collect its baseline, then
@@ -2342,6 +2475,46 @@ mod tests {
             ResidentRangeStats {
                 range_count: 2,
                 bytes: 150,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mincore_stage_reports_initial_total_and_successive_delta() -> Result<()> {
+        let baseline = [ResidentMemoryRange {
+            image_offset: 0,
+            length: 4096,
+        }];
+        assert_eq!(
+            snapshot_mincore_stage("snapshot_loaded_paused", None, &baseline)?,
+            SnapshotMincoreStage {
+                phase: "snapshot_loaded_paused",
+                total_ranges: 1,
+                total_bytes: 4096,
+                newly_resident_ranges: 0,
+                newly_resident_bytes: 0,
+            }
+        );
+
+        let current = [
+            ResidentMemoryRange {
+                image_offset: 0,
+                length: 4096,
+            },
+            ResidentMemoryRange {
+                image_offset: 8192,
+                length: 4096,
+            },
+        ];
+        assert_eq!(
+            snapshot_mincore_stage("firecracker_resumed", Some(&baseline), &current)?,
+            SnapshotMincoreStage {
+                phase: "firecracker_resumed",
+                total_ranges: 2,
+                total_bytes: 8192,
+                newly_resident_ranges: 1,
+                newly_resident_bytes: 4096,
             }
         );
         Ok(())
