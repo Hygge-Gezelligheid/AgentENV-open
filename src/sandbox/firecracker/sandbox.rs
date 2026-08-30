@@ -763,6 +763,21 @@ impl FirecrackerSandbox {
         Ok(sandbox)
     }
 
+    #[cfg(test)]
+    fn from_snapshot_with_test_work_dir(
+        snapshot: &RunnableSnapshot,
+        launch_config: &SandboxLaunchConfig,
+        work_dir: &Path,
+    ) -> Result<Self> {
+        let mut snapshot_config = Self::snapshot_config_for_launch(snapshot, launch_config)?;
+        snapshot_config.common.firecracker_work_base_dir = Some(work_dir.to_path_buf());
+
+        Self::build(
+            launch_config.sandbox_id,
+            LaunchMode::Resume(snapshot_config),
+        )
+    }
+
     fn snapshot_config_for_launch(
         snapshot: &RunnableSnapshot,
         launch_config: &SandboxLaunchConfig,
@@ -3389,6 +3404,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_prefault_uses_gpa_regions_before_sending_ranges() -> Result<()> {
+        let work_dir = TempDir::new()?;
         let snapshot = RunnableSnapshot::from_test_manifest_with_working_set(
             SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
             GuestMemoryWorkingSet::new(vec![super::super::manifest::GuestMemoryRange {
@@ -3401,7 +3417,11 @@ mod tests {
             snapshot_id: "persisted-prefault-test".to_string(),
             ..SandboxLaunchConfig::default()
         };
-        let sandbox = FirecrackerSandbox::from_snapshot(&snapshot, &launch_config)?;
+        let sandbox = FirecrackerSandbox::from_snapshot_with_test_work_dir(
+            &snapshot,
+            &launch_config,
+            work_dir.path(),
+        )?;
         let listener = UnixListener::bind(sandbox.fc_instance.api_socket_path())?;
 
         let server = tokio::spawn(async move {
@@ -3463,6 +3483,7 @@ mod tests {
 
     #[tokio::test]
     async fn runnable_snapshot_pvm_skips_guest_memory_api() -> Result<()> {
+        let work_dir = TempDir::new()?;
         let snapshot = RunnableSnapshot::from_test_manifest_with_working_set(
             SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
             GuestMemoryWorkingSet::new(vec![super::super::manifest::GuestMemoryRange {
@@ -3475,7 +3496,11 @@ mod tests {
             snapshot_id: "pvm-prefault-gate-test".to_string(),
             ..SandboxLaunchConfig::default()
         };
-        let sandbox = FirecrackerSandbox::from_snapshot(&snapshot, &launch_config)?;
+        let sandbox = FirecrackerSandbox::from_snapshot_with_test_work_dir(
+            &snapshot,
+            &launch_config,
+            work_dir.path(),
+        )?;
         let listener = UnixListener::bind(sandbox.fc_instance.api_socket_path())?;
         let mut config = prefault_enabled_config();
         config.virtualization_mode = crate::virtualization::VirtualizationMode::Pvm;
