@@ -14,6 +14,7 @@ mod mmds;
 mod overlaybd_snapshot;
 mod pool;
 mod prefault;
+mod prefault_stats;
 mod process_vm_reader;
 mod sandbox;
 mod socket;
@@ -25,10 +26,12 @@ pub use config::{
 pub use factory::FirecrackerSandboxFactory;
 pub(super) use instance::FirecrackerInstance;
 pub use manifest::{
-    FirecrackerSnapshotManifest, GuestMemoryWorkingSet, GuestMemoryWorkingSetLimits,
+    FirecrackerSnapshotManifest, GuestMemoryRange, GuestMemoryWorkingSet,
+    GuestMemoryWorkingSetLimits,
 };
 pub use pool::FirecrackerPool;
+pub use prefault_stats::PrefaultCompletionStats;
 pub use sandbox::{
     FirecrackerCapturedSnapshot, FirecrackerPausedState, FirecrackerSandbox, SnapshotMincoreStage,
-    SnapshotPrefaultCandidate,
+    SnapshotPrefaultCandidate, SnapshotResumeTimings,
 };

@@ -12,7 +12,8 @@ use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig
 use firecracker_client::models::{
     Balloon, BootSource, DirtyMemoryRanges, Drive, InstanceActionInfo, Logger,
     MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, PreFaultMemoryRange,
-    PreFaultMemoryRequest, RateLimiter, SnapshotCreateParams, SnapshotLoadParams, Vm,
+    PreFaultMemoryRequest, PreFaultMemoryStats, RateLimiter, SnapshotCreateParams,
+    SnapshotLoadParams, Vm,
 };
 use hyper::Method;
 use nix::sys::signal::{kill, Signal};
@@ -564,7 +565,7 @@ impl FirecrackerInstance {
     pub async fn pre_fault_memory(
         &self,
         ranges: &[super::manifest::GuestMemoryRange],
-    ) -> Result<()> {
+    ) -> Result<Option<PreFaultMemoryStats>> {
         if ranges.is_empty() {
             bail!("refusing to send an empty pre-fault request to Firecracker");
         }
@@ -577,14 +578,16 @@ impl FirecrackerInstance {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        self.client
-            .request_no_content(
+        let stats: Option<PreFaultMemoryStats> = self
+            .client
+            .request(
                 Method::PUT,
                 "/vm/pre-fault-memory",
                 Some(&PreFaultMemoryRequest::new(ranges)),
             )
             .await
-            .context("Failed to pre-fault guest memory")
+            .context("Failed to pre-fault guest memory")?;
+        Ok(stats)
     }
 
     /// Loads a snapshot with uffd memory backend.

@@ -73,6 +73,7 @@ fn filtered_benchmark_names() -> Result<Option<Vec<String>>> {
         println!("snapshot_mincore_stages");
         println!("snapshot_prefault_e2e");
         println!("snapshot_prefault_phase_e2e");
+        println!("snapshot_prefault_workload");
         return Ok(None);
     }
 
@@ -477,6 +478,20 @@ fn bench_snapshot_concurrent_resume(c: &mut Criterion) {
 }
 
 const PREFAULT_ARM_ORDER: [bool; 4] = [false, true, true, false];
+const PREFAULT_WORKLOAD_SETUP: &str =
+    "dd if=/dev/zero of=/tmp/aenv-prefault-workload.bin bs=1M count=8 conv=fsync status=none && sync";
+const PREFAULT_WORKLOAD_REQUEST: &str = "sha256sum /tmp/aenv-prefault-workload.bin >/dev/null";
+
+#[derive(Clone, Debug)]
+struct PrefaultMeasurement {
+    restore_setup: Duration,
+    snapshot_load: Duration,
+    prefault: Duration,
+    firecracker_resume: Duration,
+    envd_ready: Duration,
+    guest_command: Duration,
+    total: Duration,
+}
 
 fn prefault_working_set_limits() -> GuestMemoryWorkingSetLimits {
     let profiling = &ConfigManager::global_config().template_profiling;
@@ -487,12 +502,10 @@ fn prefault_working_set_limits() -> GuestMemoryWorkingSetLimits {
     }
 }
 
-async fn prepare_profiled_snapshot() -> Result<(FirecrackerSnapshotConfig, usize, u64)> {
-    let mut snapshot = prepare_snapshot().await?;
-    let working_set =
-        FirecrackerSandbox::profile_snapshot_working_set(&snapshot, prefault_working_set_limits())
-            .await
-            .context("profile benchmark snapshot working set")?;
+fn attach_profiled_working_set(
+    mut snapshot: FirecrackerSnapshotConfig,
+    working_set: agentenv::sandbox::GuestMemoryWorkingSet,
+) -> Result<(FirecrackerSnapshotConfig, usize, u64)> {
     let range_count = working_set.ranges.len();
     let byte_count = working_set
         .total_bytes()
@@ -505,33 +518,101 @@ async fn prepare_profiled_snapshot() -> Result<(FirecrackerSnapshotConfig, usize
     Ok((snapshot, range_count, byte_count))
 }
 
-async fn resume_to_guest_ready(
-    snapshot: &FirecrackerSnapshotConfig,
-    prefault_enabled: bool,
-) -> Result<Duration> {
-    let started = Instant::now();
-    let mut sandbox =
-        FirecrackerSandbox::resume_from_snapshot_config_with_prefault(snapshot, prefault_enabled)
+async fn prepare_profiled_snapshot() -> Result<(FirecrackerSnapshotConfig, usize, u64)> {
+    let snapshot = prepare_snapshot().await?;
+    let working_set =
+        FirecrackerSandbox::profile_snapshot_working_set(&snapshot, prefault_working_set_limits())
             .await
-            .context("resume snapshot")?;
-    let ready_result = sandbox
-        .executor()?
-        .run_command("true", &[])
-        .await
-        .context("wait for guest command readiness");
-    let elapsed = started.elapsed();
-    let stop_result = sandbox.stop().await;
-
-    ready_result?;
-    stop_result.context("stop measured sandbox")?;
-    Ok(elapsed)
+            .context("profile benchmark snapshot working set")?;
+    attach_profiled_working_set(snapshot, working_set)
 }
 
-async fn prefault_e2e_samples(
+async fn run_guest_shell(
+    sandbox: &FirecrackerSandbox,
+    command: &str,
+    description: &str,
+) -> Result<()> {
+    let output = sandbox
+        .executor()?
+        .run_command("sh", &["-lc", command])
+        .await
+        .with_context(|| format!("run {description}"))?;
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "{description} failed with exit code {}: {}",
+        output.exit_code,
+        output.stderr
+    );
+    Ok(())
+}
+
+async fn prepare_profiled_workload_snapshot() -> Result<(FirecrackerSnapshotConfig, usize, u64)> {
+    let mut sandbox = setup_sandbox().await?;
+    run_guest_shell(
+        &sandbox,
+        PREFAULT_WORKLOAD_SETUP,
+        "prefault workload fixture setup",
+    )
+    .await?;
+    let snapshot = sandbox.pause().await?;
+    sandbox.stop().await?;
+
+    let working_set = FirecrackerSandbox::profile_snapshot_working_set_with_workload(
+        &snapshot,
+        prefault_working_set_limits(),
+        |sandbox| {
+            Box::pin(run_guest_shell(
+                sandbox,
+                PREFAULT_WORKLOAD_REQUEST,
+                "profile workload",
+            ))
+        },
+    )
+    .await
+    .context("profile workload benchmark snapshot working set")?;
+    attach_profiled_working_set(snapshot, working_set)
+}
+
+async fn resume_and_measure(
+    snapshot: &FirecrackerSnapshotConfig,
+    prefault_enabled: bool,
+    command: &str,
+    description: &str,
+) -> Result<PrefaultMeasurement> {
+    let total_started = Instant::now();
+    let (mut sandbox, timings) =
+        FirecrackerSandbox::resume_from_snapshot_config_with_prefault_and_timings(
+            snapshot,
+            prefault_enabled,
+        )
+        .await
+        .context("resume snapshot")?;
+    let guest_command_started = Instant::now();
+    let command_result = run_guest_shell(&sandbox, command, description).await;
+    let guest_command = guest_command_started.elapsed();
+    let total = total_started.elapsed();
+    let stop_result = sandbox.stop().await;
+
+    command_result?;
+    stop_result.context("stop measured sandbox")?;
+    Ok(PrefaultMeasurement {
+        restore_setup: timings.restore_setup,
+        snapshot_load: timings.snapshot_load,
+        prefault: timings.prefault,
+        firecracker_resume: timings.firecracker_resume,
+        envd_ready: timings.envd_ready,
+        guest_command,
+        total,
+    })
+}
+
+async fn prefault_measurement_samples(
     snapshot: &FirecrackerSnapshotConfig,
     hot: bool,
     prefault_enabled: bool,
-) -> Result<Vec<Duration>> {
+    command: &str,
+    description: &str,
+) -> Result<Vec<PrefaultMeasurement>> {
     let mut warm_sandbox = if hot {
         let sandbox = FirecrackerSandbox::resume_from_snapshot_config_with_prefault(
             snapshot,
@@ -539,11 +620,7 @@ async fn prefault_e2e_samples(
         )
         .await
         .context("start hot-path holder")?;
-        sandbox
-            .executor()?
-            .run_command("true", &[])
-            .await
-            .context("wait for hot-path holder readiness")?;
+        run_guest_shell(&sandbox, "true", "hot-path holder readiness").await?;
         Some(sandbox)
     } else {
         None
@@ -552,7 +629,8 @@ async fn prefault_e2e_samples(
     let result = async {
         let mut samples = Vec::with_capacity(DEFAULT_SAMPLE_COUNT);
         for _ in 0..DEFAULT_SAMPLE_COUNT {
-            samples.push(resume_to_guest_ready(snapshot, prefault_enabled).await?);
+            samples
+                .push(resume_and_measure(snapshot, prefault_enabled, command, description).await?);
             tokio::time::sleep(cleanup_settle_time()).await;
         }
         Ok(samples)
@@ -565,17 +643,75 @@ async fn prefault_e2e_samples(
     result
 }
 
+fn print_prefault_measurements(name: &str, samples: &[PrefaultMeasurement]) {
+    print_samples(
+        name,
+        &samples
+            .iter()
+            .map(|sample| sample.total)
+            .collect::<Vec<_>>(),
+    );
+    print_samples(
+        &format!("{name}_restore_setup"),
+        &samples
+            .iter()
+            .map(|sample| sample.restore_setup)
+            .collect::<Vec<_>>(),
+    );
+    print_samples(
+        &format!("{name}_snapshot_load"),
+        &samples
+            .iter()
+            .map(|sample| sample.snapshot_load)
+            .collect::<Vec<_>>(),
+    );
+    print_samples(
+        &format!("{name}_prefault"),
+        &samples
+            .iter()
+            .map(|sample| sample.prefault)
+            .collect::<Vec<_>>(),
+    );
+    print_samples(
+        &format!("{name}_firecracker_resume"),
+        &samples
+            .iter()
+            .map(|sample| sample.firecracker_resume)
+            .collect::<Vec<_>>(),
+    );
+    print_samples(
+        &format!("{name}_envd_ready"),
+        &samples
+            .iter()
+            .map(|sample| sample.envd_ready)
+            .collect::<Vec<_>>(),
+    );
+    print_samples(
+        &format!("{name}_guest_command"),
+        &samples
+            .iter()
+            .map(|sample| sample.guest_command)
+            .collect::<Vec<_>>(),
+    );
+}
+
 fn run_prefault_e2e_benchmark(rt: &Runtime) -> Result<()> {
     let (snapshot, range_count, byte_count) = rt.block_on(prepare_profiled_snapshot())?;
     println!(
         "prefault_e2e invariant: one profiled snapshot; working-set ranges {range_count}, bytes {byte_count}; only the in-process pre-fault boolean differs between arms"
     );
 
-    for (mode, hot) in [("cold", false), ("hot", true)] {
+    for (mode, hot) in [("resource_cold", false), ("hot", true)] {
         for (run, enabled) in PREFAULT_ARM_ORDER.into_iter().enumerate() {
-            let samples = rt.block_on(prefault_e2e_samples(&snapshot, hot, enabled))?;
+            let samples = rt.block_on(prefault_measurement_samples(
+                &snapshot,
+                hot,
+                enabled,
+                "true",
+                "guest readiness command",
+            ))?;
             let arm = if enabled { "enabled" } else { "disabled" };
-            print_samples(
+            print_prefault_measurements(
                 &format!("prefault_e2e_{mode}_{arm}_run{}", run + 1),
                 &samples,
             );
@@ -661,6 +797,29 @@ fn run_prefault_phase_e2e_benchmark(rt: &Runtime) -> Result<()> {
         ))?;
         print_samples(
             &format!("prefault_phase_cold_{}_run{}", arm.name, run + 1),
+            &samples,
+        );
+    }
+    Ok(())
+}
+
+fn run_prefault_workload_benchmark(rt: &Runtime) -> Result<()> {
+    let (snapshot, range_count, byte_count) = rt.block_on(prepare_profiled_workload_snapshot())?;
+    println!(
+        "prefault_workload invariant: one profiled snapshot; workload is a 8 MiB guest file read plus sha256 via AgentENV envd; working-set ranges {range_count}, bytes {byte_count}; only the in-process pre-fault boolean differs between arms"
+    );
+
+    for (run, enabled) in PREFAULT_ARM_ORDER.into_iter().enumerate() {
+        let samples = rt.block_on(prefault_measurement_samples(
+            &snapshot,
+            false,
+            enabled,
+            PREFAULT_WORKLOAD_REQUEST,
+            "first guest workload request",
+        ))?;
+        let arm = if enabled { "enabled" } else { "disabled" };
+        print_prefault_measurements(
+            &format!("prefault_workload_resource_cold_{arm}_run{}", run + 1),
             &samples,
         );
     }
@@ -871,6 +1030,8 @@ fn run_default_snapshot_benchmarks() -> Result<()> {
     }
     if should_run("snapshot_prefault_phase_e2e", &filters) {
         run_prefault_phase_e2e_benchmark(&rt)?;
+    if should_run("snapshot_prefault_workload", &filters) {
+        run_prefault_workload_benchmark(&rt)?;
         ran = true;
     }
 

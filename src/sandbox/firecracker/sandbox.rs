@@ -3,6 +3,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -29,6 +30,7 @@ use super::overlaybd_snapshot::{
 };
 use super::pool::{warm_stderr_path, warm_stdout_path, FirecrackerPool};
 use super::prefault::{build_prefault_plan, PrefaultPlan};
+use super::prefault_stats::PrefaultCompletionStats;
 use super::socket::is_http_status_error;
 use super::FirecrackerInstance;
 use crate::sandbox::custom_extension::{
@@ -62,6 +64,21 @@ use crate::types::SandboxId;
 const VM_STATE_FILE_NAME: &str = "vm_state.bin";
 const ROOTFS_DRIVE_PATH: &str = "rootfs.ext4";
 const USER_ROOTFS_DRIVE_PATH: &str = "user-rootfs";
+
+/// Timings for the observable stages of a snapshot restore.
+///
+/// `restore_setup` covers host-side resource preparation before the
+/// Firecracker snapshot-load request. The remaining fields deliberately match
+/// the load, KVM pre-fault, resume, and envd-ready boundaries.
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotResumeTimings {
+    pub restore_setup: Duration,
+    pub snapshot_load: Duration,
+    pub prefault: Duration,
+    pub prefault_stats: Option<PrefaultCompletionStats>,
+    pub firecracker_resume: Duration,
+    pub envd_ready: Duration,
+}
 
 /// Firecracker's `TokenBucket::size` is the number of tokens replenished every
 /// `refill_time`, not a per-second rate. Pinning the refill period to 1000 ms
@@ -684,13 +701,11 @@ impl FirecrackerSandbox {
     /// Call [`FirecrackerSandbox::start`] or [`FirecrackerSandbox::start_nowait`] to boot it.
     #[tracing::instrument(skip(snapshot))]
     pub fn from_snapshot_config(snapshot: &FirecrackerSnapshotConfig) -> Result<Self> {
-        let mut sandbox = Self::from_snapshot_config_with_override(
+        Self::from_snapshot_config_with_override(
             snapshot.clone(),
             SandboxId::new(),
             snapshot.common.envd_access_token.clone(),
-        )?;
-        sandbox.restore_working_set = snapshot.restore_working_set.clone();
-        Ok(sandbox)
+        )
     }
 
     /// Build a throwaway profiling sandbox. It loads the snapshot with dirty
@@ -790,13 +805,40 @@ impl FirecrackerSandbox {
     }
 
     async fn start_with_prefault(&mut self, prefault_enabled: bool) -> Result<()> {
+        self.start_with_prefault_and_timings(prefault_enabled)
+            .await
+            .map(|_| ())
+    }
+
+    async fn start_with_prefault_and_timings(
+        &mut self,
+        prefault_enabled: bool,
+    ) -> Result<SnapshotResumeTimings> {
+        self.start_with_prefault_and_timings_with_max_prefault_bytes(prefault_enabled, None)
+            .await
+    }
+
+    async fn start_with_prefault_and_timings_with_max_prefault_bytes(
+        &mut self,
+        prefault_enabled: bool,
+        max_prefault_bytes: Option<u64>,
+    ) -> Result<SnapshotResumeTimings> {
         self.launch.validate()?;
         let LaunchMode::Resume(config) = &self.launch else {
             bail!("pre-fault override requires a snapshot-resume launch");
         };
-        self.start_resume_with_prefault(config.clone(), prefault_enabled)
-            .await?;
-        self.wait_for_ready().await
+        let mut timings = SnapshotResumeTimings::default();
+        self.start_resume_with_prefault(
+            config.clone(),
+            prefault_enabled,
+            max_prefault_bytes,
+            Some(&mut timings),
+        )
+        .await?;
+        let envd_ready_started = std::time::Instant::now();
+        self.wait_for_ready().await?;
+        timings.envd_ready = envd_ready_started.elapsed();
+        Ok(timings)
     }
     /// Start the sandbox WITHOUT waiting for envd's readiness.
     ///
@@ -816,7 +858,7 @@ impl FirecrackerSandbox {
         let LaunchMode::Resume(config) = &self.launch else {
             bail!("profiling requires a snapshot-resume launch");
         };
-        self.start_resume_with_options(config.clone(), false, None)
+        self.start_resume_with_options(config.clone(), false, None, None)
             .await
     }
 
@@ -1274,9 +1316,48 @@ impl FirecrackerSandbox {
         Ok(sandbox)
     }
 
+    /// Resume from a snapshot with an explicit pre-fault choice and record
+    /// each restore stage. This is for controlled diagnostics and benchmarks;
+    /// normal restores retain their configuration-driven behavior.
+    #[tracing::instrument(skip(snapshot))]
+    pub async fn resume_from_snapshot_config_with_prefault_and_timings(
+        snapshot: &FirecrackerSnapshotConfig,
+        prefault_enabled: bool,
+    ) -> Result<(Self, SnapshotResumeTimings)> {
+        Self::resume_from_snapshot_config_with_prefault_and_timings_for_benchmark(
+            snapshot,
+            prefault_enabled,
+            None,
+        )
+        .await
+    }
+
+    /// Resume from a snapshot with benchmark-only pre-fault limits.
+    ///
+    /// This deliberately requires an explicit caller-provided limit. Product
+    /// restores continue to use node configuration and cannot reach this API.
+    #[tracing::instrument(skip(snapshot))]
+    pub async fn resume_from_snapshot_config_with_prefault_and_timings_for_benchmark(
+        snapshot: &FirecrackerSnapshotConfig,
+        prefault_enabled: bool,
+        max_prefault_bytes: Option<u64>,
+    ) -> Result<(Self, SnapshotResumeTimings)> {
+        let mut sandbox = Self::from_snapshot_config(snapshot)?;
+        let timings = sandbox
+            .start_with_prefault_and_timings_with_max_prefault_bytes(
+                prefault_enabled,
+                max_prefault_bytes,
+            )
+            .await?;
+        Ok((sandbox, timings))
+    }
+
     /// Load a dedicated throwaway profiler paused, collect its baseline, then
-    /// resume through the normal envd ready/init boundary, pause it, and
-    /// harvest the final Firecracker mincore ranges.
+    /// resume only through envd readiness and harvest the newly resident
+    /// Firecracker mincore ranges.
+    ///
+    /// This deliberately excludes envd initialization and any guest workload:
+    /// published metadata targets the restore-to-ready path.
     /// The profiler owns an exclusive memory UBLK device and never releases its
     /// memory background download notification.
     pub async fn profile_snapshot_working_set(
@@ -1288,9 +1369,53 @@ impl FirecrackerSandbox {
         let result = async {
             profiler.start_profiling_paused().await?;
             let baseline = profiler.fc_instance.get_resident_memory_ranges().await?;
+            profiler.fc_instance.resume().await?;
+            profiler.wait_for_envd_ready().await?;
+            let ready = profiler.fc_instance.get_resident_memory_ranges().await?;
+            let regions = profiler
+                .fc_instance
+                .get_guest_memory_image_regions()
+                .await?;
+            snapshot_prefault_candidate("envd_ready", &baseline, &ready, &regions, limits)
+                .map(|candidate| candidate.working_set)
+        }
+        .await;
+        let stop_result = profiler.stop().await;
+        match (result, stop_result) {
+            (Ok(working_set), Ok(())) => Ok(working_set),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error.context("stop dedicated profiling sandbox")),
+            (Err(run_error), Err(stop_error)) => Err(anyhow::anyhow!(
+                "mincore ready-path profiling failed: {run_error:#}; additionally failed to stop profiler: {stop_error:#}"
+            )),
+        }
+    }
+
+    /// Profile the guest-memory working set after running a supplied guest
+    /// workload on the dedicated profiler restore.
+    ///
+    /// The workload runs only after envd is ready and before the profiler is
+    /// paused and sampled, so the resulting metadata represents the same
+    /// ready-plus-workload path used by the caller's restore benchmark.
+    pub async fn profile_snapshot_working_set_with_workload<F>(
+        snapshot: &FirecrackerSnapshotConfig,
+        limits: GuestMemoryWorkingSetLimits,
+        workload: F,
+    ) -> Result<GuestMemoryWorkingSet>
+    where
+        F: for<'a> FnOnce(&'a Self) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>,
+    {
+        warn_if_mincore_host_has_swap();
+        let mut profiler = Self::from_profiling_snapshot_config(snapshot)?;
+        let result = async {
+            profiler.start_profiling_paused().await?;
+            let baseline = profiler.fc_instance.get_resident_memory_ranges().await?;
             let baseline_stats = resident_range_stats(&baseline)?;
             profiler.fc_instance.resume().await?;
             profiler.wait_for_ready().await?;
+            workload(&profiler)
+                .await
+                .context("run guest workload during working-set profiling")?;
             profiler.fc_instance.pause().await?;
             let resident = profiler.fc_instance.get_resident_memory_ranges().await?;
             let final_stats = resident_range_stats(&resident)?;
@@ -1626,6 +1751,14 @@ impl Drop for FirecrackerSandbox {
 
 impl FirecrackerSandbox {
     fn build(id: SandboxId, launch: LaunchMode) -> Result<Self> {
+        // Keep persisted restore metadata with the runtime object regardless of
+        // which resume constructor was used. In particular, committed snapshots,
+        // persisted paused sandboxes, and fork children all enter through
+        // `build` rather than the benchmark-oriented `from_snapshot_config`.
+        let restore_working_set = match &launch {
+            LaunchMode::Fresh(_) => None,
+            LaunchMode::Resume(config) => config.restore_working_set.clone(),
+        };
         let work_dir =
             create_firecracker_work_dir(launch.common().firecracker_work_base_dir.as_deref())?;
         let fc_instance = FirecrackerInstance::new(work_dir.path().to_path_buf());
@@ -1656,29 +1789,56 @@ impl FirecrackerSandbox {
             extra_drive_runtimes: Vec::new(),
             live_snapshot_root: None,
             custom_extension_hook_guard: None,
-            restore_working_set: None,
+            restore_working_set,
             profiling_mode: false,
         })
     }
-
-    /// Apply a KVM pre-fault performance hint. API status failures are
+    /// Apply a KVM pre-fault performance hint. HTTP status failures are
     /// non-blocking, but a Firecracker transport failure still blocks a resume.
-    async fn try_prefault_restore(&self) -> Result<()> {
+    async fn try_prefault_restore(&self) -> Result<Option<PrefaultCompletionStats>> {
         self.try_prefault_restore_with_config(ConfigManager::global_config())
             .await
     }
 
-    async fn try_prefault_restore_with_config(&self, config: &AppConfig) -> Result<()> {
+    async fn try_prefault_restore_with_config(
+        &self,
+        config: &AppConfig,
+    ) -> Result<Option<PrefaultCompletionStats>> {
         if !config.restore_prefault.enabled {
-            return Ok(());
+            if std::env::var_os("AENV_BENCH_DEBUG_PREFAULT").is_some() {
+                eprintln!("prefault_diagnostic skipped=disabled");
+            }
+            return Ok(None);
+        }
+        if !super::prefault::prefault_supported(
+            cfg!(target_arch = "x86_64"),
+            config.virtualization_mode,
+        ) {
+            if std::env::var_os("AENV_BENCH_DEBUG_PREFAULT").is_some() {
+                eprintln!(
+                    "prefault_diagnostic skipped=unsupported_mode mode={}",
+                    config.virtualization_mode
+                );
+            }
+            debug!(
+                virtualization_mode = %config.virtualization_mode,
+                "skip restore pre-fault: unsupported architecture or virtualization mode"
+            );
+            return Ok(None);
         }
         let Some(working_set) = self.restore_working_set.as_ref() else {
+            if std::env::var_os("AENV_BENCH_DEBUG_PREFAULT").is_some() {
+                eprintln!("prefault_diagnostic skipped=missing_working_set");
+            }
             debug!("skip restore pre-fault: snapshot has no working-set metadata");
-            return Ok(());
+            return Ok(None);
         };
         if working_set.ranges.is_empty() {
+            if std::env::var_os("AENV_BENCH_DEBUG_PREFAULT").is_some() {
+                eprintln!("prefault_diagnostic skipped=empty_working_set");
+            }
             debug!("skip restore pre-fault: snapshot working-set is empty");
-            return Ok(());
+            return Ok(None);
         }
         let limits = GuestMemoryWorkingSetLimits {
             max_bytes: config.template_profiling.max_prefault_bytes,
@@ -1690,33 +1850,76 @@ impl FirecrackerSandbox {
         let regions = match self.fc_instance.get_guest_memory_regions().await {
             Ok(regions) => regions,
             Err(error) if is_http_status_error(&error) => {
+                if std::env::var_os("AENV_BENCH_DEBUG_PREFAULT").is_some() {
+                    eprintln!(
+                        "prefault_diagnostic guest_memory_regions_http_status_error error={error:#}"
+                    );
+                }
                 warn!(error = ?error, "skip restore pre-fault: guest-memory-regions unavailable");
-                return Ok(());
+                return Ok(None);
             }
             Err(error) => return Err(error.context("get guest-memory regions before pre-fault")),
         };
-        match build_prefault_plan(
-            true,
-            cfg!(target_arch = "x86_64"),
-            Some(working_set),
-            &regions,
-            limits,
-        ) {
+        match build_prefault_plan(true, true, Some(working_set), &regions, limits) {
             PrefaultPlan::Request { ranges, bytes } => {
                 let started = std::time::Instant::now();
                 match self.fc_instance.pre_fault_memory(&ranges).await {
-                    Ok(()) => {
-                        debug!(range_count = ranges.len(), bytes, elapsed = ?started.elapsed(), "restore pre-fault applied before resume")
+                    Ok(Some(api_stats)) => {
+                        let stats =
+                            PrefaultCompletionStats::from_api(api_stats, ranges.len(), bytes)
+                                .context("validate Firecracker pre-fault completion stats")?;
+                        debug!(
+                            range_count = stats.range_count,
+                            requested_bytes = stats.requested_bytes,
+                            completed_bytes = stats.completed_bytes,
+                            remaining_bytes = stats.remaining_bytes,
+                            ioctl_count = stats.ioctl_count,
+                            worker_count = stats.workers.len(),
+                            worker_stats = ?stats.workers,
+                            firecracker_wall_time_us = stats.wall_time_us,
+                            elapsed = ?started.elapsed(),
+                            "restore pre-fault completed before resume"
+                        );
+                        return Ok(Some(stats));
+                    }
+                    Ok(None) => {
+                        if std::env::var_os("AENV_BENCH_DEBUG_PREFAULT").is_some() {
+                            eprintln!(
+                                "prefault_diagnostic legacy_empty_response ranges={} bytes={}",
+                                ranges.len(),
+                                bytes
+                            );
+                        }
+                        warn!(
+                            range_count = ranges.len(),
+                            bytes,
+                            "Firecracker pre-fault returned legacy empty success response; completion cannot be verified"
+                        );
                     }
                     Err(error) if is_http_status_error(&error) => {
-                        warn!(error = ?error, range_count = ranges.len(), bytes, "restore pre-fault failed; resuming normally")
+                        if std::env::var_os("AENV_BENCH_DEBUG_PREFAULT").is_some() {
+                            eprintln!(
+                                "prefault_diagnostic http_status_error ranges={} bytes={} error={error:#}",
+                                ranges.len(),
+                                bytes
+                            );
+                        }
+                        warn!(error = ?error, range_count = ranges.len(), bytes, "restore pre-fault failed; resuming normally");
                     }
                     Err(error) => return Err(error.context("pre-fault guest memory before resume")),
                 }
             }
-            PrefaultPlan::Skip(reason) => debug!(?reason, "skip restore pre-fault"),
+            PrefaultPlan::Skip(reason) => {
+                if std::env::var_os("AENV_BENCH_DEBUG_PREFAULT").is_some() {
+                    eprintln!(
+                        "prefault_diagnostic plan_skip reason={reason:?} working_set={:?} guest_regions={regions:?}",
+                        working_set.ranges
+                    );
+                }
+                debug!(?reason, "skip restore pre-fault");
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     #[tracing::instrument(skip(self, config))]
@@ -1901,17 +2104,23 @@ impl FirecrackerSandbox {
 
     #[tracing::instrument(skip(self, config))]
     async fn start_resume(&mut self, config: FirecrackerSnapshotConfig) -> Result<()> {
-        self.start_resume_with_options(config, true, None).await
+        self.start_resume_with_options(config, true, None, None)
+            .await
     }
 
     async fn start_resume_with_prefault(
         &mut self,
         config: FirecrackerSnapshotConfig,
         prefault_enabled: bool,
+        max_prefault_bytes: Option<u64>,
+        timings: Option<&mut SnapshotResumeTimings>,
     ) -> Result<()> {
         let mut runtime_config = ConfigManager::global_config().clone();
         runtime_config.restore_prefault.enabled = prefault_enabled;
-        self.start_resume_with_options(config, true, Some(&runtime_config))
+        if let Some(max_prefault_bytes) = max_prefault_bytes {
+            runtime_config.template_profiling.max_prefault_bytes = max_prefault_bytes;
+        }
+        self.start_resume_with_options(config, true, Some(&runtime_config), timings)
             .await
     }
 
@@ -1921,7 +2130,9 @@ impl FirecrackerSandbox {
         config: FirecrackerSnapshotConfig,
         resume_vm: bool,
         prefault_config: Option<&AppConfig>,
+        mut timings: Option<&mut SnapshotResumeTimings>,
     ) -> Result<()> {
+        let restore_setup_started = timings.as_deref().map(|_| std::time::Instant::now());
         // NOTE: The virtio-balloon device is NOT configured here. Balloon state
         // is part of vm_state.bin and is restored automatically by Firecracker.
         // Snapshots taken before balloon support was added will simply not have
@@ -2064,21 +2275,24 @@ impl FirecrackerSandbox {
                 .context("Failed to configure sandbox egress policy for resume")?;
         }
 
-        // ── Custom extension hook: start-resume ──
-        if let Some(client) = CustomExtensionClient::global() {
-            let slot = self
-                .network_slot
-                .as_ref()
-                .context("network slot must be allocated before start-resume hook")?;
-            let mut guard = CustomExtensionHookGuard::new(client, self.id);
-            guard
-                .start_resume(
-                    &slot.namespace_path().to_string_lossy(),
-                    slot.host_interaction_ip,
-                    config.common.custom_extension_params.as_ref(),
-                )
-                .await?;
-            self.custom_extension_hook_guard = Some(guard);
+        // A throwaway profiler must not report a customer-visible resume or
+        // create a matching stop hook: profiling is internal observation only.
+        if !self.profiling_mode {
+            if let Some(client) = CustomExtensionClient::global() {
+                let slot = self
+                    .network_slot
+                    .as_ref()
+                    .context("network slot must be allocated before start-resume hook")?;
+                let mut guard = CustomExtensionHookGuard::new(client, self.id);
+                guard
+                    .start_resume(
+                        &slot.namespace_path().to_string_lossy(),
+                        slot.host_interaction_ip,
+                        config.common.custom_extension_params.as_ref(),
+                    )
+                    .await?;
+                self.custom_extension_hook_guard = Some(guard);
+            }
         }
 
         let envd_base_url = format!(
@@ -2129,6 +2343,11 @@ impl FirecrackerSandbox {
 
         self.configure_logger(&config.common).await?;
 
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), restore_setup_started) {
+            timings.restore_setup = started.elapsed();
+        }
+        let snapshot_load_started = timings.as_deref().map(|_| std::time::Instant::now());
+
         // Override the network interface to use the new tap0 in our namespace
         let network_overrides = [("eth0", "tap0")];
         self.fc_instance
@@ -2156,12 +2375,27 @@ impl FirecrackerSandbox {
             .await
             .context("reconcile disk rate limiter on snapshot resume")?;
 
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), snapshot_load_started) {
+            timings.snapshot_load = started.elapsed();
+        }
+
         if resume_vm {
-            match prefault_config {
+            let prefault_started = timings.as_deref().map(|_| std::time::Instant::now());
+            let prefault_stats = match prefault_config {
                 Some(config) => self.try_prefault_restore_with_config(config).await?,
                 None => self.try_prefault_restore().await?,
+            };
+            if let (Some(timings), Some(started)) = (timings.as_deref_mut(), prefault_started) {
+                timings.prefault = started.elapsed();
+                timings.prefault_stats = prefault_stats;
             }
+            let firecracker_resume_started = timings.as_deref().map(|_| std::time::Instant::now());
             self.fc_instance.resume().await?;
+            if let (Some(timings), Some(started)) =
+                (timings.as_deref_mut(), firecracker_resume_started)
+            {
+                timings.firecracker_resume = started.elapsed();
+            }
             debug!("sandbox restored from snapshot config");
         } else {
             debug!("snapshot loaded paused for dedicated profiling");
@@ -3155,13 +3389,19 @@ mod tests {
 
     #[tokio::test]
     async fn restore_prefault_uses_gpa_regions_before_sending_ranges() -> Result<()> {
-        let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
-        sandbox.restore_working_set = Some(GuestMemoryWorkingSet::new(vec![
-            super::super::manifest::GuestMemoryRange {
+        let snapshot = RunnableSnapshot::from_test_manifest_with_working_set(
+            SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
+            GuestMemoryWorkingSet::new(vec![super::super::manifest::GuestMemoryRange {
                 gpa: 4 * 1024 * 1024 * 1024,
                 size: 4096,
-            },
-        ]));
+            }]),
+        );
+        let launch_config = SandboxLaunchConfig {
+            sandbox_id: SandboxId::new(),
+            snapshot_id: "persisted-prefault-test".to_string(),
+            ..SandboxLaunchConfig::default()
+        };
+        let sandbox = FirecrackerSandbox::from_snapshot(&snapshot, &launch_config)?;
         let listener = UnixListener::bind(sandbox.fc_instance.api_socket_path())?;
 
         let server = tokio::spawn(async move {
@@ -3218,6 +3458,35 @@ mod tests {
             .try_prefault_restore_with_config(&prefault_enabled_config())
             .await?;
         server.await.expect("join fake Firecracker server");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runnable_snapshot_pvm_skips_guest_memory_api() -> Result<()> {
+        let snapshot = RunnableSnapshot::from_test_manifest_with_working_set(
+            SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
+            GuestMemoryWorkingSet::new(vec![super::super::manifest::GuestMemoryRange {
+                gpa: 0,
+                size: 4096,
+            }]),
+        );
+        let launch_config = SandboxLaunchConfig {
+            sandbox_id: SandboxId::new(),
+            snapshot_id: "pvm-prefault-gate-test".to_string(),
+            ..SandboxLaunchConfig::default()
+        };
+        let sandbox = FirecrackerSandbox::from_snapshot(&snapshot, &launch_config)?;
+        let listener = UnixListener::bind(sandbox.fc_instance.api_socket_path())?;
+        let mut config = prefault_enabled_config();
+        config.virtualization_mode = crate::virtualization::VirtualizationMode::Pvm;
+
+        sandbox.try_prefault_restore_with_config(&config).await?;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "PVM must not query guest-memory regions or submit a pre-fault request"
+        );
         Ok(())
     }
 

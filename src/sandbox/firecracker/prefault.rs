@@ -4,6 +4,14 @@
 //! path submits it through the generated Firecracker client.
 
 use super::manifest::{GuestMemoryRegion, GuestMemoryWorkingSet, GuestMemoryWorkingSetLimits};
+use crate::virtualization::VirtualizationMode;
+
+/// The Firecracker KVM pre-fault API exists only on x86_64 KVM. Keep this
+/// decision ahead of any guest-memory API request so PVM/ARM restores do not
+/// parse or call APIs they cannot use.
+pub(crate) fn prefault_supported(is_x86_64: bool, virtualization_mode: VirtualizationMode) -> bool {
+    is_x86_64 && virtualization_mode == VirtualizationMode::Kvm
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PrefaultSkipReason {
@@ -127,5 +135,12 @@ mod tests {
             build_prefault_plan(true, true, Some(&working_set), &[region()], limits()),
             PrefaultPlan::Request { bytes: 4096, .. }
         ));
+    }
+
+    #[test]
+    fn support_gate_requires_x86_kvm() {
+        assert!(prefault_supported(true, VirtualizationMode::Kvm));
+        assert!(!prefault_supported(false, VirtualizationMode::Kvm));
+        assert!(!prefault_supported(true, VirtualizationMode::Pvm));
     }
 }
