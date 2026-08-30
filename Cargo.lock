@@ -183,6 +183,7 @@ dependencies = [
  "libc",
  "libublk-rs-sys",
  "overlaybd",
+ "reqwest 0.13.3",
  "serde",
  "serde_json",
  "sha2 0.10.9",
