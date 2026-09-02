@@ -878,6 +878,29 @@ paths:
           description: Internal server error
           schema:
             $ref: "#/definitions/Error"
+
+  /vm/resident-memory-ranges:
+    get:
+      summary: Returns resident guest memory ranges.
+      description:
+        Returns host-resident guest memory ranges in the same contiguous image
+        layout used by Firecracker memory snapshots. Residency is sampled with
+        mincore(2); this API neither reads nor changes KVM dirty-page state.
+        Post-boot only.
+      operationId: getResidentMemoryRanges
+      responses:
+        200:
+          description: Resident guest memory ranges
+          schema:
+            $ref: "#/definitions/ResidentMemoryRanges"
+        400:
+          description: VM is not in a valid state for this operation
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
   /vm/pre-fault-memory:
     put:
       summary: Pre-fault selected guest memory.
@@ -1545,6 +1568,53 @@ definitions:
         type: array
         items:
           $ref: "#/definitions/DirtyMemoryRange"
+
+  ResidentMemoryRange:
+    type: object
+    description:
+      Describes a contiguous host-resident guest-memory range in the
+      contiguous snapshot image layout.
+    required:
+      - base_host_virt_addr
+      - image_offset
+      - length
+    properties:
+      base_host_virt_addr:
+        type: integer
+        format: int64
+        description: Base host virtual address of the resident range.
+      image_offset:
+        type: integer
+        format: int64
+        description:
+          Cumulative byte offset of this range in the contiguous memory snapshot
+          image layout. This is not a Guest Physical Address.
+      length:
+        type: integer
+        format: int64
+        description: Resident range length in bytes.
+
+  ResidentMemoryRanges:
+    type: object
+    description:
+      Resident memory ranges for a VM, sampled with mincore(2), using the same
+      contiguous memory image layout as snapshot files.
+    required:
+      - page_size
+      - memory_size
+      - ranges
+    properties:
+      page_size:
+        type: integer
+        description: Page size used by mincore(2).
+      memory_size:
+        type: integer
+        format: int64
+        description: Total byte size of the contiguous memory snapshot image.
+      ranges:
+        type: array
+        items:
+          $ref: "#/definitions/ResidentMemoryRange"
 
   FullVmConfiguration:
     type: object

@@ -12,8 +12,8 @@ use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig
 use firecracker_client::models::{
     Balloon, BootSource, DirtyMemoryRanges, Drive, InstanceActionInfo, Logger,
     MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, PreFaultMemoryRange,
-    PreFaultMemoryRequest, PreFaultMemoryStats, RateLimiter, SnapshotCreateParams,
-    SnapshotLoadParams, Vm,
+    PreFaultMemoryRequest, PreFaultMemoryStats, RateLimiter, ResidentMemoryRanges,
+    SnapshotCreateParams, SnapshotLoadParams, Vm,
 };
 use hyper::Method;
 use nix::sys::signal::{kill, Signal};
@@ -545,7 +545,11 @@ impl FirecrackerInstance {
     /// Returns mincore-resident memory in Firecracker's contiguous image layout.
     #[tracing::instrument(skip(self))]
     pub async fn get_resident_memory_ranges(&self) -> Result<Vec<ResidentMemoryRange>> {
-        let ranges = self.get_dirty_memory_ranges().await?;
+        let ranges = self
+            .client
+            .request::<(), ResidentMemoryRanges>(Method::GET, "/vm/resident-memory-ranges", None)
+            .await
+            .context("Failed to get resident memory ranges")?;
         ranges
             .ranges
             .into_iter()
@@ -781,7 +785,7 @@ mod tests {
             for expected_path in [
                 "/vm/guest-memory-regions",
                 "/vm/guest-memory-regions",
-                "/vm/dirty-memory-ranges",
+                "/vm/resident-memory-ranges",
                 "/vm/pre-fault-memory",
             ] {
                 let (stream, _) = listener
@@ -802,7 +806,7 @@ mod tests {
                                         r#"[{"base_host_virt_addr":8192,"guest_phys_addr":4294967296,"size":4096,"offset":4096,"page_size":4096}]"#,
                                     )
                                 }
-                                "/vm/dirty-memory-ranges" => {
+                                "/vm/resident-memory-ranges" => {
                                     assert_eq!(request.method(), Method::GET);
                                     (
                                         StatusCode::OK,

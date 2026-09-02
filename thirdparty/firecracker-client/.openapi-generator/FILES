@@ -1,4 +1,5 @@
 .gitignore
+.openapi-generator-ignore
 .travis.yml
 Cargo.toml
 README.md
@@ -40,7 +41,11 @@ docs/PartialNetworkInterface.md
 docs/Pmem.md
 docs/PreFaultMemoryRange.md
 docs/PreFaultMemoryRequest.md
+docs/PreFaultMemoryStats.md
+docs/PreFaultMemoryWorkerStats.md
 docs/RateLimiter.md
+docs/ResidentMemoryRange.md
+docs/ResidentMemoryRanges.md
 docs/SerialDevice.md
 docs/SnapshotCreateParams.md
 docs/SnapshotLoadParams.md
@@ -91,7 +96,11 @@ src/models/partial_network_interface.rs
 src/models/pmem.rs
 src/models/pre_fault_memory_range.rs
 src/models/pre_fault_memory_request.rs
+src/models/pre_fault_memory_stats.rs
+src/models/pre_fault_memory_worker_stats.rs
 src/models/rate_limiter.rs
+src/models/resident_memory_range.rs
+src/models/resident_memory_ranges.rs
 src/models/serial_device.rs
 src/models/snapshot_create_params.rs
 src/models/snapshot_load_params.rs
