@@ -851,8 +851,10 @@ impl FirecrackerSandbox {
         )
         .await?;
         let envd_ready_started = std::time::Instant::now();
-        self.wait_for_ready().await?;
+        self.wait_for_envd_ready().await?;
         timings.envd_ready = envd_ready_started.elapsed();
+        self.release_background_downloads_after_envd_ready().await;
+        self.initialize_envd().await?;
         Ok(timings)
     }
     /// Start the sandbox WITHOUT waiting for envd's readiness.
