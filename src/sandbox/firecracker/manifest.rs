@@ -166,8 +166,8 @@ impl GuestMemoryWorkingSet {
                 .context("working-set GPA range overflows u64")?;
             if let Some(previous_end) = previous_end {
                 ensure!(
-                    previous_end < range.gpa,
-                    "working-set ranges must be sorted, non-overlapping, and coalesced"
+                    previous_end <= range.gpa,
+                    "working-set ranges must be sorted and non-overlapping"
                 );
             }
             previous_end = Some(end);
@@ -579,16 +579,6 @@ mod tests {
                     size: 0x1000,
                 },
             ],
-            vec![
-                GuestMemoryRange {
-                    gpa: 0,
-                    size: 0x1000,
-                },
-                GuestMemoryRange {
-                    gpa: 0x1000,
-                    size: 0x1000,
-                },
-            ],
         ] {
             assert!(GuestMemoryWorkingSet::new(ranges).validate_shape().is_err());
         }
@@ -617,6 +607,21 @@ mod tests {
         working_set.validate_shape()?;
         working_set.validate_for_regions(&regions, working_set_limits())?;
         Ok(())
+    }
+
+    #[test]
+    fn working_set_allows_adjacent_ranges_to_preserve_region_boundaries() -> Result<()> {
+        let working_set = GuestMemoryWorkingSet::new(vec![
+            GuestMemoryRange {
+                gpa: 0,
+                size: GUEST_MEMORY_PAGE_SIZE,
+            },
+            GuestMemoryRange {
+                gpa: GUEST_MEMORY_PAGE_SIZE,
+                size: GUEST_MEMORY_PAGE_SIZE,
+            },
+        ]);
+        working_set.validate_shape()
     }
 
     #[test]

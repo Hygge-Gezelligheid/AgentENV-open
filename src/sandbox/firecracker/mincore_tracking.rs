@@ -47,9 +47,10 @@ pub(crate) fn resident_ranges_to_working_set(
             .image_offset
             .checked_add(range.length)
             .context("resident image range overflows u64")?;
-        let region = regions
+        let (region_index, region) = regions
             .iter()
-            .find(|region| {
+            .enumerate()
+            .find(|(_, region)| {
                 let region_end = region.image_offset.checked_add(region.size);
                 range.image_offset >= region.image_offset && region_end.is_some_and(|e| end <= e)
             })
@@ -67,16 +68,23 @@ pub(crate) fn resident_ranges_to_working_set(
             .context("resident GPA start overflows u64")?;
         gpa.checked_add(range.length)
             .context("resident GPA end overflows u64")?;
-        ranges.push(GuestMemoryRange {
-            gpa,
-            size: range.length,
-        });
+        ranges.push((
+            region_index,
+            GuestMemoryRange {
+                gpa,
+                size: range.length,
+            },
+        ));
     }
 
-    ranges.sort_by_key(|range| range.gpa);
+    ranges.sort_by_key(|(_, range)| range.gpa);
     let mut coalesced: Vec<GuestMemoryRange> = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        if let Some(previous) = coalesced.last_mut() {
+    let mut previous_region = None;
+    for (region_index, range) in ranges {
+        if previous_region == Some(region_index) {
+            let previous = coalesced
+                .last_mut()
+                .expect("region marker requires a previous range");
             let previous_end = previous
                 .gpa
                 .checked_add(previous.size)
@@ -93,6 +101,7 @@ pub(crate) fn resident_ranges_to_working_set(
             }
         }
         coalesced.push(range);
+        previous_region = Some(region_index);
     }
     let working_set = GuestMemoryWorkingSet::new(coalesced);
     let ram_regions = regions
@@ -262,6 +271,52 @@ mod tests {
                 GuestMemoryRange {
                     gpa: 0x1_0000_0000,
                     size: 0x1000
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn does_not_coalesce_across_adjacent_guest_memory_regions() -> Result<()> {
+        let regions = vec![
+            GuestMemoryImageRegion {
+                image_offset: 0,
+                guest_phys_addr: 0,
+                size: 0x1000,
+                page_size: 4096,
+            },
+            GuestMemoryImageRegion {
+                image_offset: 0x1000,
+                guest_phys_addr: 0x1000,
+                size: 0x1000,
+                page_size: 4096,
+            },
+        ];
+        let set = resident_ranges_to_working_set(
+            &[
+                ResidentMemoryRange {
+                    image_offset: 0,
+                    length: 0x1000,
+                },
+                ResidentMemoryRange {
+                    image_offset: 0x1000,
+                    length: 0x1000,
+                },
+            ],
+            &regions,
+            limits(),
+        )?;
+        assert_eq!(
+            set.ranges,
+            vec![
+                GuestMemoryRange {
+                    gpa: 0,
+                    size: 0x1000,
+                },
+                GuestMemoryRange {
+                    gpa: 0x1000,
+                    size: 0x1000,
                 },
             ]
         );
