@@ -1810,8 +1810,7 @@ impl FirecrackerSandbox {
             profiling_mode: false,
         })
     }
-    /// Apply a KVM pre-fault performance hint. HTTP status failures are
-    /// non-blocking, but a Firecracker transport failure still blocks a resume.
+    /// Apply a KVM pre-fault performance hint without blocking a normal restore.
     async fn try_prefault_restore(&self) -> Result<Option<PrefaultCompletionStats>> {
         self.try_prefault_restore_with_config(ConfigManager::global_config())
             .await
@@ -1875,16 +1874,27 @@ impl FirecrackerSandbox {
                 warn!(error = ?error, "skip restore pre-fault: guest-memory-regions unavailable");
                 return Ok(None);
             }
-            Err(error) => return Err(error.context("get guest-memory regions before pre-fault")),
+            Err(error) => {
+                warn!(error = ?error, "skip restore pre-fault: guest-memory-regions unavailable");
+                return Ok(None);
+            }
         };
         match build_prefault_plan(true, true, Some(working_set), &regions, limits) {
             PrefaultPlan::Request { ranges, bytes } => {
                 let started = std::time::Instant::now();
                 match self.fc_instance.pre_fault_memory(&ranges).await {
                     Ok(Some(api_stats)) => {
-                        let stats =
-                            PrefaultCompletionStats::from_api(api_stats, ranges.len(), bytes)
-                                .context("validate Firecracker pre-fault completion stats")?;
+                        let stats = match PrefaultCompletionStats::from_api(
+                            api_stats,
+                            ranges.len(),
+                            bytes,
+                        ) {
+                            Ok(stats) => stats,
+                            Err(error) => {
+                                warn!(error = ?error, range_count = ranges.len(), bytes, "skip restore pre-fault: completion stats are invalid");
+                                return Ok(None);
+                            }
+                        };
                         debug!(
                             range_count = stats.range_count,
                             requested_bytes = stats.requested_bytes,
@@ -1923,7 +1933,9 @@ impl FirecrackerSandbox {
                         }
                         warn!(error = ?error, range_count = ranges.len(), bytes, "restore pre-fault failed; resuming normally");
                     }
-                    Err(error) => return Err(error.context("pre-fault guest memory before resume")),
+                    Err(error) => {
+                        warn!(error = ?error, range_count = ranges.len(), bytes, "restore pre-fault failed; resuming normally");
+                    }
                 }
             }
             PrefaultPlan::Skip(reason) => {
@@ -3577,22 +3589,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_prefault_transport_failure_blocks_resume() -> Result<()> {
+    async fn restore_prefault_transport_failure_is_non_blocking() -> Result<()> {
         let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
         sandbox.restore_working_set = Some(GuestMemoryWorkingSet::new(vec![
             super::super::manifest::GuestMemoryRange { gpa: 0, size: 4096 },
         ]));
 
-        let error = sandbox
+        let stats = sandbox
             .try_prefault_restore_with_config(&prefault_enabled_config())
             .await
-            .expect_err("missing Firecracker socket must block resume");
-        assert!(
-            error
-                .to_string()
-                .contains("get guest-memory regions before pre-fault"),
-            "unexpected transport error: {error:#}"
-        );
+            .expect("missing Firecracker socket must not block resume");
+        assert!(stats.is_none());
         Ok(())
     }
 }
