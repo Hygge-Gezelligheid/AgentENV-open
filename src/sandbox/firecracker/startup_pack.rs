@@ -261,6 +261,9 @@ impl LocalStartupPrefetch {
             .await
             .is_err()
         {
+            warn!(
+                "local startup prefetch teardown exceeded its wait budget; reads may still drain"
+            );
             self.task.abort();
         }
     }
@@ -282,21 +285,36 @@ struct SharedLocalPrefetch {
 }
 
 struct LocalPrefetchLease {
+    identity: String,
     shared: Arc<SharedLocalPrefetch>,
     released: bool,
 }
 
 impl LocalPrefetchLease {
+    /// Release this subscriber while holding the registry lock that protects
+    /// acquisition. The final release removes this run before exposing its
+    /// cancellation, so a new restore starts a replacement instead of joining
+    /// a draining, permanently-cancelled worker.
     fn release(&mut self) -> bool {
         if self.released {
             return false;
         }
         self.released = true;
-        if self.shared.subscribers.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.shared.cancel.store(true, Ordering::Release);
-            return true;
+        let mut runs = local_prefetches()
+            .lock()
+            .expect("local prefetch registry poisoned");
+        if self.shared.subscribers.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return false;
         }
-        false
+        self.shared.cancel.store(true, Ordering::Release);
+        let maps_to_this_run = runs
+            .get(&self.identity)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|run| Arc::ptr_eq(&run, &self.shared));
+        if maps_to_this_run {
+            runs.remove(&self.identity);
+        }
+        true
     }
 }
 
@@ -334,8 +352,11 @@ fn acquire_local_prefetch(identity: String) -> (Arc<SharedLocalPrefetch>, bool) 
         .expect("local prefetch registry poisoned");
     runs.retain(|_, run| run.strong_count() != 0);
     if let Some(shared) = runs.get(&identity).and_then(std::sync::Weak::upgrade) {
-        shared.subscribers.fetch_add(1, Ordering::AcqRel);
-        return (shared, false);
+        if !shared.cancel.load(Ordering::Acquire) && !shared.finished.load(Ordering::Acquire) {
+            shared.subscribers.fetch_add(1, Ordering::AcqRel);
+            return (shared, false);
+        }
+        runs.remove(&identity);
     }
     let shared = Arc::new(SharedLocalPrefetch {
         subscribers: std::sync::atomic::AtomicUsize::new(1),
@@ -382,53 +403,42 @@ async fn local_startup_prefetch(
             .memory_startup_pack
             .consume_timeout_secs,
     );
-    match tokio::time::timeout(
+    let prepared = match tokio::time::timeout(
         timeout,
-        local_startup_prefetch_inner(image_config, global_config, pack, subscriber_cancel),
+        prepare_local_prefetch(image_config, global_config, pack, &subscriber_cancel),
     )
     .await
     {
-        Ok(result) => result,
+        Ok(result) => result?,
         Err(_) => {
-            warn!("local startup manifest prefetch timed out");
-            Ok(())
+            warn!("local startup manifest prefetch preparation timed out");
+            return Ok(());
         }
-    }
+    };
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+    local_startup_prefetch_inner(prepared, subscriber_cancel).await
 }
 
 async fn local_startup_prefetch_inner(
-    image_config: PathBuf,
-    global_config: PathBuf,
-    pack: crate::snapshot::ResolvedStartupPack,
+    prepared: PreparedLocalPrefetch,
     subscriber_cancel: Arc<AtomicBool>,
 ) -> Result<()> {
-    let Some(prepared) =
-        prepare_local_prefetch(image_config, global_config, pack, &subscriber_cancel).await?
-    else {
-        return Ok(());
-    };
     let (shared, leader) = acquire_local_prefetch(prepared.identity.clone());
     let mut lease = LocalPrefetchLease {
+        identity: prepared.identity.clone(),
         shared: Arc::clone(&shared),
         released: false,
     };
     if leader {
         let worker = Arc::clone(&shared);
         tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                prepared.timeout,
+            finish_local_prefetch_worker(
+                Arc::clone(&worker),
                 execute_local_prefetch(prepared, Arc::clone(&worker)),
             )
             .await;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => warn!(%error, "local startup manifest prefetch failed"),
-                Err(_) => {
-                    worker.cancel.store(true, Ordering::Release);
-                    warn!("local startup manifest prefetch timed out");
-                }
-            }
-            worker.finished.store(true, Ordering::Release);
         });
     }
     while !shared.finished.load(Ordering::Acquire) {
@@ -524,19 +534,32 @@ async fn execute_local_prefetch(
     prepared: PreparedLocalPrefetch,
     shared: Arc<SharedLocalPrefetch>,
 ) -> Result<()> {
-    let plan = overlaybd::pack_planner::plan_ranges(
-        &prepared.manifest.ranges,
-        prepared.manifest.mem_virtual_size,
-        &prepared.layers,
-        prepared.max_pack_bytes,
-    )
-    .await?;
+    let deadline = tokio::time::Instant::now() + prepared.timeout;
+    let plan = tokio::select! {
+        plan = overlaybd::pack_planner::plan_ranges(
+            &prepared.manifest.ranges,
+            prepared.manifest.mem_virtual_size,
+            &prepared.layers,
+            prepared.max_pack_bytes,
+        ) => plan?,
+        _ = tokio::time::sleep_until(deadline) => {
+            shared.cancel.store(true, Ordering::Release);
+            warn!("local startup manifest prefetch timed out while planning");
+            return Ok(());
+        }
+    };
     for batch in plan.blocks.chunks(LOCAL_PREFETCH_MAX_READS) {
-        if shared.cancel.load(Ordering::Acquire) {
+        if shared.cancel.load(Ordering::Acquire) || tokio::time::Instant::now() >= deadline {
+            shared.cancel.store(true, Ordering::Release);
             return Ok(());
         }
         let mut workers = Vec::with_capacity(batch.len());
+        let mut dispatch_error = None;
         for block in batch {
+            if shared.cancel.load(Ordering::Acquire) || tokio::time::Instant::now() >= deadline {
+                shared.cancel.store(true, Ordering::Release);
+                break;
+            }
             let object = &plan.objects[block.object as usize];
             let path = match &prepared.layers[object.layer].source {
                 overlaybd::pack_planner::FinalLayerBytes::LocalPath(path) => path.clone(),
@@ -545,24 +568,78 @@ async fn execute_local_prefetch(
             let offset = u64::from(block.block_id) * overlaybd::pack_planner::OBJECT_BLOCK_BYTES;
             let len =
                 ((object.size - offset).min(overlaybd::pack_planner::OBJECT_BLOCK_BYTES)) as usize;
-            let permit = Arc::clone(local_prefetch_read_permits())
-                .acquire_owned()
-                .await
-                .context("local prefetch read semaphore closed")?;
+            let permit = tokio::select! {
+                permit = Arc::clone(local_prefetch_read_permits()).acquire_owned() => {
+                    match permit {
+                        Ok(permit) => permit,
+                        Err(error) => {
+                            dispatch_error = Some(error.into());
+                            shared.cancel.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    shared.cancel.store(true, Ordering::Release);
+                    break;
+                }
+            };
             let cancel = Arc::clone(&shared);
             workers.push(tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 read_local_prefetch_block(path, offset, len, cancel)
             }));
         }
-        for worker in workers {
-            worker
-                .await
-                .context("local startup prefetch worker panicked")??;
+        let drained = drain_local_prefetch_workers(workers, &shared).await;
+        if let Some(error) = dispatch_error {
+            drained.context("drain local prefetch reads after dispatch failure")?;
+            return Err(error);
         }
+        drained?;
     }
     Ok(())
 }
+
+/// Await every dispatched blocking read even after a failure. `spawn_blocking`
+/// work cannot be force-cancelled; draining keeps finished/resource accounting
+/// truthful and retains permits and file descriptors until the reads return.
+async fn drain_local_prefetch_workers(
+    workers: Vec<tokio::task::JoinHandle<Result<()>>>,
+    shared: &SharedLocalPrefetch,
+) -> Result<()> {
+    let mut first_error = None;
+    for worker in workers {
+        match worker
+            .await
+            .context("local startup prefetch worker panicked")
+            .and_then(|result| result)
+        {
+            Ok(()) => {}
+            Err(error) => {
+                shared.cancel.store(true, Ordering::Release);
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+async fn finish_local_prefetch_worker<F>(shared: Arc<SharedLocalPrefetch>, execution: F)
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    match execution.await {
+        Ok(()) => {}
+        Err(error) => warn!(%error, "local startup manifest prefetch failed"),
+    }
+    shared.finished.store(true, Ordering::Release);
+}
+
 fn read_local_prefetch_block(
     path: PathBuf,
     offset: u64,
@@ -757,14 +834,16 @@ mod tests {
     fn local_prefetch_dedup_keeps_remaining_subscriber_running() {
         let key = format!("dedup-test-{}", uuid::Uuid::new_v4());
         let (first, first_leader) = acquire_local_prefetch(key.clone());
-        let (second, second_leader) = acquire_local_prefetch(key);
+        let (second, second_leader) = acquire_local_prefetch(key.clone());
         assert!(first_leader);
         assert!(!second_leader);
         let first_lease = LocalPrefetchLease {
+            identity: key.clone(),
             shared: Arc::clone(&first),
             released: false,
         };
         let second_lease = LocalPrefetchLease {
+            identity: key,
             shared: second,
             released: false,
         };
@@ -793,6 +872,137 @@ mod tests {
         );
     }
 
+    #[test]
+    fn acquire_after_final_release_never_reuses_cancelled_worker() {
+        let key = format!("replacement-test-{}", uuid::Uuid::new_v4());
+        let (draining, leader) = acquire_local_prefetch(key.clone());
+        assert!(leader);
+        let mut lease = LocalPrefetchLease {
+            identity: key.clone(),
+            shared: Arc::clone(&draining),
+            released: false,
+        };
+        assert!(lease.release());
+        assert!(draining.cancel.load(Ordering::Acquire));
+
+        let (replacement, replacement_leader) = acquire_local_prefetch(key.clone());
+        assert!(replacement_leader);
+        assert!(!Arc::ptr_eq(&draining, &replacement));
+        assert!(!replacement.cancel.load(Ordering::Acquire));
+        drop(LocalPrefetchLease {
+            identity: key,
+            shared: replacement,
+            released: false,
+        });
+    }
+
+    #[test]
+    fn concurrent_release_and_acquire_never_returns_cancelled_worker() {
+        let key = format!("concurrent-test-{}", uuid::Uuid::new_v4());
+        let (first, leader) = acquire_local_prefetch(key.clone());
+        assert!(leader);
+        let lease = LocalPrefetchLease {
+            identity: key.clone(),
+            shared: Arc::clone(&first),
+            released: false,
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let release_barrier = Arc::clone(&barrier);
+        let release = std::thread::spawn(move || {
+            release_barrier.wait();
+            let mut lease = lease;
+            lease.release()
+        });
+        barrier.wait();
+        let (next, _) = acquire_local_prefetch(key.clone());
+        release.join().expect("release thread must not panic");
+        assert!(
+            !next.cancel.load(Ordering::Acquire),
+            "a concurrent acquire must receive an active worker"
+        );
+        drop(LocalPrefetchLease {
+            identity: key,
+            shared: next,
+            released: false,
+        });
+    }
+
+    #[tokio::test]
+    async fn timeout_cleanup_drains_slow_read_before_marking_finished() {
+        let shared = Arc::new(SharedLocalPrefetch {
+            subscribers: std::sync::atomic::AtomicUsize::new(1),
+            cancel: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        });
+        let read_started = Arc::new(AtomicBool::new(false));
+        let allow_read_finish = Arc::new(AtomicBool::new(false));
+        let read_finished = Arc::new(AtomicBool::new(false));
+        let started = Arc::clone(&read_started);
+        let allow = Arc::clone(&allow_read_finish);
+        let completed = Arc::clone(&read_finished);
+        let read = tokio::task::spawn_blocking(move || {
+            started.store(true, Ordering::Release);
+            while !allow.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            completed.store(true, Ordering::Release);
+            Ok::<(), anyhow::Error>(())
+        });
+        while !read_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let worker_shared = Arc::clone(&shared);
+        let cleanup = async move {
+            worker_shared.cancel.store(true, Ordering::Release);
+            drain_local_prefetch_workers(vec![read], &worker_shared).await
+        };
+        let runner = tokio::spawn(finish_local_prefetch_worker(Arc::clone(&shared), cleanup));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!read_finished.load(Ordering::Acquire));
+        assert!(
+            !shared.finished.load(Ordering::Acquire),
+            "finished must wait for a dispatched blocking read"
+        );
+        allow_read_finish.store(true, Ordering::Release);
+        runner.await.expect("worker runner must not panic");
+        assert!(read_finished.load(Ordering::Acquire));
+        assert!(shared.finished.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn failed_batch_drains_remaining_reads() {
+        let shared = Arc::new(SharedLocalPrefetch {
+            subscribers: std::sync::atomic::AtomicUsize::new(1),
+            cancel: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        });
+        let allow_read_finish = Arc::new(AtomicBool::new(false));
+        let read_finished = Arc::new(AtomicBool::new(false));
+        let allow = Arc::clone(&allow_read_finish);
+        let completed = Arc::clone(&read_finished);
+        let slow_read = tokio::task::spawn_blocking(move || {
+            while !allow.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            completed.store(true, Ordering::Release);
+            Ok::<(), anyhow::Error>(())
+        });
+        let failed_read = tokio::task::spawn_blocking(|| {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("controlled prefetch read failure"))
+        });
+        let drain_shared = Arc::clone(&shared);
+        let drain = tokio::spawn(async move {
+            drain_local_prefetch_workers(vec![failed_read, slow_read], &drain_shared).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(shared.cancel.load(Ordering::Acquire));
+        assert!(!read_finished.load(Ordering::Acquire));
+        assert!(!drain.is_finished(), "the slow read must still be drained");
+        allow_read_finish.store(true, Ordering::Release);
+        assert!(drain.await.expect("drain task must not panic").is_err());
+        assert!(read_finished.load(Ordering::Acquire));
+    }
+
     #[tokio::test]
     async fn last_subscriber_waits_for_worker_to_finish_after_cancellation() {
         let shared = Arc::new(SharedLocalPrefetch {
@@ -809,6 +1019,7 @@ mod tests {
             worker_shared.finished.store(true, Ordering::Release);
         });
         let mut lease = LocalPrefetchLease {
+            identity: "standalone-test-worker".to_owned(),
             shared: Arc::clone(&shared),
             released: false,
         };
