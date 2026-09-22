@@ -535,18 +535,19 @@ async fn execute_local_prefetch(
     shared: Arc<SharedLocalPrefetch>,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + prepared.timeout;
-    let plan = tokio::select! {
-        plan = overlaybd::pack_planner::plan_ranges(
+    let Some(plan) = await_local_prefetch_planner(
+        overlaybd::pack_planner::plan_ranges(
             &prepared.manifest.ranges,
             prepared.manifest.mem_virtual_size,
             &prepared.layers,
             prepared.max_pack_bytes,
-        ) => plan?,
-        _ = tokio::time::sleep_until(deadline) => {
-            shared.cancel.store(true, Ordering::Release);
-            warn!("local startup manifest prefetch timed out while planning");
-            return Ok(());
-        }
+        ),
+        deadline,
+        &shared,
+    )
+    .await?
+    else {
+        return Ok(());
     };
     for batch in plan.blocks.chunks(LOCAL_PREFETCH_MAX_READS) {
         if shared.cancel.load(Ordering::Acquire) || tokio::time::Instant::now() >= deadline {
@@ -587,17 +588,42 @@ async fn execute_local_prefetch(
             let cancel = Arc::clone(&shared);
             workers.push(tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                read_local_prefetch_block(path, offset, len, cancel)
+                read_local_prefetch_block(path, offset, len, deadline, cancel)
             }));
         }
-        let drained = drain_local_prefetch_workers(workers, &shared).await;
+        let mut drained = Box::pin(drain_local_prefetch_workers(workers, &shared));
+        tokio::select! {
+            result = &mut drained => result?,
+            _ = tokio::time::sleep_until(deadline) => {
+                shared.cancel.store(true, Ordering::Release);
+                drained.await?;
+            }
+        }
         if let Some(error) = dispatch_error {
-            drained.context("drain local prefetch reads after dispatch failure")?;
             return Err(error);
         }
-        drained?;
     }
     Ok(())
+}
+
+/// Retain the planner future across timeout. The planner can own offloaded
+/// local metadata reads, so dropping it would detach those reads and allow the
+/// shared worker to report completion too early.
+async fn await_local_prefetch_planner<F, T>(
+    planner: F,
+    deadline: tokio::time::Instant,
+    shared: &SharedLocalPrefetch,
+) -> Result<Option<T>>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let plan = planner.await?;
+    if tokio::time::Instant::now() >= deadline {
+        shared.cancel.store(true, Ordering::Release);
+        warn!("local startup manifest prefetch timed out while planning");
+        return Ok(None);
+    }
+    Ok(Some(plan))
 }
 
 /// Await every dispatched blocking read even after a failure. `spawn_blocking`
@@ -644,14 +670,15 @@ fn read_local_prefetch_block(
     path: PathBuf,
     offset: u64,
     len: usize,
+    deadline: tokio::time::Instant,
     shared: Arc<SharedLocalPrefetch>,
 ) -> Result<()> {
-    if shared.cancel.load(Ordering::Acquire) {
+    if shared.cancel.load(Ordering::Acquire) || tokio::time::Instant::now() >= deadline {
         return Ok(());
     }
     use std::os::unix::fs::FileExt;
     let file = std::fs::File::open(path)?;
-    if shared.cancel.load(Ordering::Acquire) {
+    if shared.cancel.load(Ordering::Acquire) || tokio::time::Instant::now() >= deadline {
         return Ok(());
     }
     let mut buffer = vec![0; len];
@@ -1001,6 +1028,75 @@ mod tests {
         allow_read_finish.store(true, Ordering::Release);
         assert!(drain.await.expect("drain task must not panic").is_err());
         assert!(read_finished.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn planner_timeout_waits_for_offloaded_metadata_before_finished() {
+        let shared = Arc::new(SharedLocalPrefetch {
+            subscribers: std::sync::atomic::AtomicUsize::new(1),
+            cancel: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        });
+        let allow_metadata_finish = Arc::new(AtomicBool::new(false));
+        let metadata_finished = Arc::new(AtomicBool::new(false));
+        let allow = Arc::clone(&allow_metadata_finish);
+        let completed = Arc::clone(&metadata_finished);
+        let planner = async move {
+            let metadata = tokio::task::spawn_blocking(move || {
+                while !allow.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                completed.store(true, Ordering::Release);
+                Ok::<(), anyhow::Error>(())
+            });
+            metadata
+                .await
+                .context("controlled metadata worker panicked")??;
+            Ok::<(), anyhow::Error>(())
+        };
+        let planner_shared = Arc::clone(&shared);
+        let execution = async move {
+            let result = await_local_prefetch_planner(
+                planner,
+                tokio::time::Instant::now() + Duration::from_millis(10),
+                &planner_shared,
+            )
+            .await?;
+            assert!(
+                result.is_none(),
+                "deadline must suppress data-read dispatch"
+            );
+            Ok(())
+        };
+        let runner = tokio::spawn(finish_local_prefetch_worker(Arc::clone(&shared), execution));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!metadata_finished.load(Ordering::Acquire));
+        assert!(
+            !shared.finished.load(Ordering::Acquire),
+            "finished must retain planner-owned metadata I/O"
+        );
+        allow_metadata_finish.store(true, Ordering::Release);
+        runner.await.expect("planner runner must not panic");
+        assert!(metadata_finished.load(Ordering::Acquire));
+        assert!(shared.finished.load(Ordering::Acquire));
+        assert!(shared.cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn expired_queued_read_does_not_open_a_file() {
+        let shared = Arc::new(SharedLocalPrefetch {
+            subscribers: std::sync::atomic::AtomicUsize::new(1),
+            cancel: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        });
+        read_local_prefetch_block(
+            PathBuf::from("/definitely-missing-expired-prefetch-read"),
+            0,
+            1,
+            tokio::time::Instant::now() - Duration::from_millis(1),
+            shared,
+        )
+        .expect("expired queued read must return before opening the path");
     }
 
     #[tokio::test]
