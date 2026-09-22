@@ -426,13 +426,16 @@ impl UblkDeviceManager {
             .snapshot
             .memory_startup_pack
             .consume_timeout_secs;
+        let crate::snapshot::ResolvedStartupPackSource::OssUrl(url) = &pack.source else {
+            return;
+        };
         let result = async {
             let client = self.require_client()?;
             client
                 .prefetch_startup_pack(
                     image_config,
                     global_config,
-                    &pack.url,
+                    url,
                     pack.pack_size,
                     &pack.index_sha256,
                     pack.mem_virtual_size,

@@ -1,6 +1,7 @@
 //! Startup memory pack artifact constants and the committed-record
 //! descriptor. The wire format itself lives in the overlaybd crate (shared
 //! with the ublk daemon); this module re-exports what agentenv needs.
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -112,8 +113,8 @@ impl Drop for StartupManifestTaskGuard {
 }
 
 /// Startup pack descriptor persisted in the committed record when — and only
-/// when — the pack was recorded AND uploaded successfully. Older snapshots
-/// and POSIX-backend snapshots never carry it.
+/// when — the pack was recorded and its repository backend saved the manifest.
+/// It is absent for older snapshots and best-effort recording failures.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryStartupPackInfo {
     pub pack_size: u64,
@@ -125,13 +126,18 @@ pub struct MemoryStartupPackInfo {
     pub index_sha256: String,
 }
 
-/// Runtime-only startup pack reference handed from the OSS resolver to the
-/// sandbox start: everything the daemon needs to register the pack's
-/// prefetch. Never trusted on its own — the daemon verifies the pack's
-/// index against `index_sha256` before importing any block.
+/// Runtime-only startup pack reference handed from a repository resolver to
+/// sandbox start. The source explicitly distinguishes OSS URLs from local
+/// POSIX paths. Never trusted on its own — the consumer verifies the pack's
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResolvedStartupPackSource {
+    OssUrl(String),
+    LocalPath(PathBuf),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedStartupPack {
-    pub url: String,
+    pub source: ResolvedStartupPackSource,
     pub pack_size: u64,
     pub index_sha256: String,
     pub mem_virtual_size: u64,
@@ -151,7 +157,25 @@ pub fn resolve_startup_pack_ref(
     }
     let info = info?;
     Some(ResolvedStartupPack {
-        url: url(),
+        source: ResolvedStartupPackSource::OssUrl(url()),
+        pack_size: info.pack_size,
+        index_sha256: info.index_sha256.clone(),
+        mem_virtual_size: info.mem_virtual_size,
+    })
+}
+
+/// Resolve a POSIX repository manifest to an explicit local source.
+pub fn resolve_local_startup_pack_ref(
+    info: Option<&MemoryStartupPackInfo>,
+    consume_enabled: bool,
+    path: PathBuf,
+) -> Option<ResolvedStartupPack> {
+    if !consume_enabled {
+        return None;
+    }
+    let info = info?;
+    Some(ResolvedStartupPack {
+        source: ResolvedStartupPackSource::LocalPath(path),
         pack_size: info.pack_size,
         index_sha256: info.index_sha256.clone(),
         mem_virtual_size: info.mem_virtual_size,
@@ -228,6 +252,33 @@ mod tests {
         assert_eq!(resolved.pack_size, 4096);
         assert_eq!(resolved.mem_virtual_size, 1 << 30);
         assert_eq!(resolved.index_sha256, "ab".repeat(32));
-        assert!(resolved.url.ends_with("memory-startup.pack"));
+        assert!(
+            matches!(resolved.source, ResolvedStartupPackSource::OssUrl(ref url) if url.ends_with("memory-startup.pack"))
+        );
+    }
+
+    #[test]
+    fn resolve_local_startup_pack_gates_consumption_and_marks_local_source() {
+        let info = MemoryStartupPackInfo {
+            pack_size: 4096,
+            mem_virtual_size: 1 << 30,
+            index_sha256: "ab".repeat(32),
+        };
+        assert!(
+            resolve_local_startup_pack_ref(Some(&info), false, PathBuf::from("/repo/pack"))
+                .is_none()
+        );
+        assert!(resolve_local_startup_pack_ref(None, true, PathBuf::from("/repo/pack")).is_none());
+        let resolved = resolve_local_startup_pack_ref(
+            Some(&info),
+            true,
+            PathBuf::from("/repo/artifacts/id/memory-startup.pack"),
+        )
+        .expect("local descriptor must resolve when consumption is enabled");
+        assert!(matches!(
+            resolved.source,
+            ResolvedStartupPackSource::LocalPath(ref path)
+                if path.ends_with("memory-startup.pack")
+        ));
     }
 }

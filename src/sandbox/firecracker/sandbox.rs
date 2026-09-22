@@ -184,6 +184,7 @@ pub struct FirecrackerSandbox {
     envd_instance: Option<EnvdInstance>,
     rootfs_runtime: Option<OverlaybdRuntimeHandle>,
     mem_ublk_device: Option<SharedReadOnlyDevice>,
+    startup_prefetch_task: Option<super::startup_pack::LocalStartupPrefetch>,
     tools_ublk_device: Option<SharedReadOnlyDevice>,
     /// Dedicated, non-shared memory device used only by startup-pack
     /// recording VMs (`pack_recording = true`). Released with
@@ -1371,6 +1372,10 @@ impl FirecrackerSandbox {
     pub async fn stop(&mut self) -> Result<()> {
         debug!("stopping firecracker sandbox");
 
+        if let Some(task) = self.startup_prefetch_task.take() {
+            task.stop().await;
+        }
+
         self.fc_instance
             .stop(self.runtime_policy.socket_timeout)
             .await?;
@@ -1705,6 +1710,7 @@ impl FirecrackerSandbox {
             current_custom_extension_params,
             envd_instance: None,
             rootfs_runtime: None,
+            startup_prefetch_task: None,
             mem_ublk_device: None,
             tools_ublk_device: None,
             mem_dedicated_device: None,
@@ -2159,18 +2165,29 @@ impl FirecrackerSandbox {
                 .context("arm startup pack recorder")?;
             device_path
         } else {
-            // Register the startup manifest prefetch BEFORE opening the
-            // memory image: the prefetch then refills into the same cache
-            // the device opens, racing guest faults from the very first
-            // metadata read. Registration itself never blocks the resume.
             if let Some(pack) = &config.memory_startup_pack {
-                UblkDeviceManager::global()
-                    .prefetch_startup_pack(
-                        &config.mem_overlaybd_config.image_config_path,
-                        &mem_global_config,
-                        pack,
-                    )
-                    .await;
+                match &pack.source {
+                    crate::snapshot::ResolvedStartupPackSource::OssUrl(_) => {
+                        UblkDeviceManager::global()
+                            .prefetch_startup_pack(
+                                &config.mem_overlaybd_config.image_config_path,
+                                &mem_global_config,
+                                pack,
+                            )
+                            .await;
+                    }
+                    crate::snapshot::ResolvedStartupPackSource::LocalPath(_) => {
+                        if let Some(task) = self.startup_prefetch_task.take() {
+                            task.stop().await;
+                        }
+                        self.startup_prefetch_task =
+                            Some(super::startup_pack::submit_local_startup_prefetch(
+                                config.mem_overlaybd_config.image_config_path.clone(),
+                                mem_global_config.clone(),
+                                pack.clone(),
+                            ));
+                    }
+                }
             }
             let mem_device = UblkDeviceManager::global()
                 .get_or_create_shared_mem(

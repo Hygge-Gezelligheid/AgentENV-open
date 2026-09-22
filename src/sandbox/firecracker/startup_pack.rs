@@ -10,6 +10,10 @@
 //! a manifest.
 
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -17,16 +21,14 @@ use tracing::{debug, info, warn};
 use uvm_ublk_daemon::protocol::PackRecordingState;
 
 use super::{FirecrackerSandbox, FirecrackerSnapshotConfig};
-use crate::cfg::{ConfigManager, SnapshotRepositoryBackendKind};
+use crate::cfg::ConfigManager;
 use crate::sandbox::ublk::UblkDeviceManager;
 use crate::snapshot::MEMORY_STARTUP_TRACE_ARTIFACT;
 
-/// Recording happens only for the OSS repository backend with the feature
-/// enabled: POSIX-backed snapshots resolve memory layers to plain repository
-/// file paths, so there is no small-request object-storage chain to absorb.
+/// Recording is opt-in for every repository backend. The publisher selects
+/// the durable manifest destination appropriate to its backend.
 fn recording_enabled_for(config: &crate::cfg::SnapshotConfig) -> bool {
     config.memory_startup_pack.enabled
-        && config.repository_backend == SnapshotRepositoryBackendKind::Oss
 }
 
 fn recording_enabled() -> bool {
@@ -191,6 +193,7 @@ async fn boot_and_wait(
     match outcome {
         WaitOutcome::Done(Some((pages, bytes))) => {
             debug!(pages, bytes, "startup pack recording finished");
+
             Some(trace_path.to_path_buf())
         }
         WaitOutcome::Done(None) => None,
@@ -241,9 +244,348 @@ async fn derive_recording_mem_config(src: &Path, snapshot_dir: &Path) -> Result<
     Ok(derived)
 }
 
+/// A subscriber to a shared, bounded local page-cache warmup.
+///
+/// Each restoring sandbox owns a subscriber. A subscriber leaving cancels only
+/// its own interest; the actual reads stop only after the final subscriber has
+/// gone away. This keeps one teardown from aborting another restore.
+pub(crate) struct LocalStartupPrefetch {
+    cancel: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl LocalStartupPrefetch {
+    pub(crate) async fn stop(mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if tokio::time::timeout(Duration::from_secs(5), &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+        }
+    }
+}
+
+impl Drop for LocalStartupPrefetch {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.task.abort();
+    }
+}
+
+const LOCAL_PREFETCH_MAX_READS: usize = 4;
+
+struct SharedLocalPrefetch {
+    subscribers: std::sync::atomic::AtomicUsize,
+    cancel: AtomicBool,
+    finished: AtomicBool,
+}
+
+struct LocalPrefetchLease {
+    shared: Arc<SharedLocalPrefetch>,
+    released: bool,
+}
+
+impl LocalPrefetchLease {
+    fn release(&mut self) -> bool {
+        if self.released {
+            return false;
+        }
+        self.released = true;
+        if self.shared.subscribers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shared.cancel.store(true, Ordering::Release);
+            return true;
+        }
+        false
+    }
+}
+
+impl Drop for LocalPrefetchLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct PreparedLocalPrefetch {
+    identity: String,
+    manifest: overlaybd::startup_manifest::StartupManifest,
+    layers: Vec<overlaybd::pack_planner::FinalLayerSource>,
+    max_pack_bytes: u64,
+    timeout: Duration,
+}
+
+fn local_prefetches() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Weak<SharedLocalPrefetch>>,
+> {
+    static RUNS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<SharedLocalPrefetch>>>,
+    > = std::sync::OnceLock::new();
+    RUNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn local_prefetch_read_permits() -> &'static Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(LOCAL_PREFETCH_MAX_READS)))
+}
+
+fn acquire_local_prefetch(identity: String) -> (Arc<SharedLocalPrefetch>, bool) {
+    let mut runs = local_prefetches()
+        .lock()
+        .expect("local prefetch registry poisoned");
+    runs.retain(|_, run| run.strong_count() != 0);
+    if let Some(shared) = runs.get(&identity).and_then(std::sync::Weak::upgrade) {
+        shared.subscribers.fetch_add(1, Ordering::AcqRel);
+        return (shared, false);
+    }
+    let shared = Arc::new(SharedLocalPrefetch {
+        subscribers: std::sync::atomic::AtomicUsize::new(1),
+        cancel: AtomicBool::new(false),
+        finished: AtomicBool::new(false),
+    });
+    runs.insert(identity, Arc::downgrade(&shared));
+    (shared, true)
+}
+
+async fn wait_for_local_prefetch_finished(shared: &SharedLocalPrefetch) {
+    while !shared.finished.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Submit buffered local reads without delaying resume. The physical run is
+/// deduplicated by both descriptor SHA-256 and final local layer identities.
+pub(crate) fn submit_local_startup_prefetch(
+    image_config: PathBuf,
+    global_config: PathBuf,
+    pack: crate::snapshot::ResolvedStartupPack,
+) -> LocalStartupPrefetch {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let subscriber_cancel = Arc::clone(&cancel);
+    let task = tokio::spawn(async move {
+        if let Err(error) =
+            local_startup_prefetch(image_config, global_config, pack, subscriber_cancel).await
+        {
+            warn!(%error, "local startup manifest prefetch failed; resuming on demand");
+        }
+    });
+    LocalStartupPrefetch { cancel, task }
+}
+async fn local_startup_prefetch(
+    image_config: PathBuf,
+    global_config: PathBuf,
+    pack: crate::snapshot::ResolvedStartupPack,
+    subscriber_cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    let timeout = Duration::from_secs(
+        ConfigManager::global_config()
+            .snapshot
+            .memory_startup_pack
+            .consume_timeout_secs,
+    );
+    match tokio::time::timeout(
+        timeout,
+        local_startup_prefetch_inner(image_config, global_config, pack, subscriber_cancel),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            warn!("local startup manifest prefetch timed out");
+            Ok(())
+        }
+    }
+}
+
+async fn local_startup_prefetch_inner(
+    image_config: PathBuf,
+    global_config: PathBuf,
+    pack: crate::snapshot::ResolvedStartupPack,
+    subscriber_cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    let Some(prepared) =
+        prepare_local_prefetch(image_config, global_config, pack, &subscriber_cancel).await?
+    else {
+        return Ok(());
+    };
+    let (shared, leader) = acquire_local_prefetch(prepared.identity.clone());
+    let mut lease = LocalPrefetchLease {
+        shared: Arc::clone(&shared),
+        released: false,
+    };
+    if leader {
+        let worker = Arc::clone(&shared);
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                prepared.timeout,
+                execute_local_prefetch(prepared, Arc::clone(&worker)),
+            )
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(%error, "local startup manifest prefetch failed"),
+                Err(_) => {
+                    worker.cancel.store(true, Ordering::Release);
+                    warn!("local startup manifest prefetch timed out");
+                }
+            }
+            worker.finished.store(true, Ordering::Release);
+        });
+    }
+    while !shared.finished.load(Ordering::Acquire) {
+        if subscriber_cancel.load(Ordering::Acquire) {
+            if lease.release() {
+                wait_for_local_prefetch_finished(&shared).await;
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
+async fn prepare_local_prefetch(
+    image_config: PathBuf,
+    global_config: PathBuf,
+    pack: crate::snapshot::ResolvedStartupPack,
+    subscriber_cancel: &AtomicBool,
+) -> Result<Option<PreparedLocalPrefetch>> {
+    if subscriber_cancel.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let crate::snapshot::startup_pack::ResolvedStartupPackSource::LocalPath(manifest_path) =
+        pack.source
+    else {
+        return Ok(None);
+    };
+    let startup_config = &ConfigManager::global_config().snapshot.memory_startup_pack;
+    if overlaybd::config::load_global_config(&global_config)?.io_engine == 2 {
+        warn!(path = %manifest_path.display(), "skipping local startup prefetch for O_DIRECT");
+        return Ok(None);
+    }
+    let bytes = tokio::fs::read(&manifest_path).await?;
+    if subscriber_cancel.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        bytes.len() as u64 == pack.pack_size,
+        "startup manifest size changed"
+    );
+    anyhow::ensure!(
+        crate::snapshot::startup_pack::hex_sha256(&bytes) == pack.index_sha256,
+        "startup manifest sha256 mismatch"
+    );
+    let manifest = overlaybd::startup_manifest::decode_manifest(&bytes)?;
+    anyhow::ensure!(
+        manifest.mem_virtual_size == pack.mem_virtual_size,
+        "startup manifest memory size mismatch"
+    );
+    let image = overlaybd::config::load_image_config(&image_config)?;
+    if subscriber_cancel.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let layers = image
+        .lowers
+        .iter()
+        .filter(|layer| !layer.file.is_empty())
+        .map(|layer| overlaybd::pack_planner::FinalLayerSource {
+            digest: layer.digest.clone(),
+            size: layer.size,
+            source: overlaybd::pack_planner::FinalLayerBytes::LocalPath(PathBuf::from(&layer.file)),
+        })
+        .collect::<Vec<_>>();
+    Ok(Some(PreparedLocalPrefetch {
+        identity: local_prefetch_identity(&pack.index_sha256, &layers),
+        manifest,
+        layers,
+        max_pack_bytes: startup_config.max_pack_bytes,
+        timeout: Duration::from_secs(startup_config.consume_timeout_secs),
+    }))
+}
+
+fn local_prefetch_identity(
+    pack_sha256: &str,
+    layers: &[overlaybd::pack_planner::FinalLayerSource],
+) -> String {
+    format!(
+        "{}|{}",
+        pack_sha256,
+        layers
+            .iter()
+            .map(|layer| match &layer.source {
+                overlaybd::pack_planner::FinalLayerBytes::LocalPath(path) =>
+                    format!("{}:{}:{}", layer.digest, layer.size, path.display()),
+                overlaybd::pack_planner::FinalLayerBytes::VFile(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    )
+}
+async fn execute_local_prefetch(
+    prepared: PreparedLocalPrefetch,
+    shared: Arc<SharedLocalPrefetch>,
+) -> Result<()> {
+    let plan = overlaybd::pack_planner::plan_ranges(
+        &prepared.manifest.ranges,
+        prepared.manifest.mem_virtual_size,
+        &prepared.layers,
+        prepared.max_pack_bytes,
+    )
+    .await?;
+    for batch in plan.blocks.chunks(LOCAL_PREFETCH_MAX_READS) {
+        if shared.cancel.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut workers = Vec::with_capacity(batch.len());
+        for block in batch {
+            let object = &plan.objects[block.object as usize];
+            let path = match &prepared.layers[object.layer].source {
+                overlaybd::pack_planner::FinalLayerBytes::LocalPath(path) => path.clone(),
+                overlaybd::pack_planner::FinalLayerBytes::VFile(_) => unreachable!(),
+            };
+            let offset = u64::from(block.block_id) * overlaybd::pack_planner::OBJECT_BLOCK_BYTES;
+            let len =
+                ((object.size - offset).min(overlaybd::pack_planner::OBJECT_BLOCK_BYTES)) as usize;
+            let permit = Arc::clone(local_prefetch_read_permits())
+                .acquire_owned()
+                .await
+                .context("local prefetch read semaphore closed")?;
+            let cancel = Arc::clone(&shared);
+            workers.push(tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                read_local_prefetch_block(path, offset, len, cancel)
+            }));
+        }
+        for worker in workers {
+            worker
+                .await
+                .context("local startup prefetch worker panicked")??;
+        }
+    }
+    Ok(())
+}
+fn read_local_prefetch_block(
+    path: PathBuf,
+    offset: u64,
+    len: usize,
+    shared: Arc<SharedLocalPrefetch>,
+) -> Result<()> {
+    if shared.cancel.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::open(path)?;
+    if shared.cancel.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let mut buffer = vec![0; len];
+    file.read_exact_at(&mut buffer, offset)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfg::SnapshotRepositoryBackendKind;
 
     #[tokio::test]
     async fn recording_mem_config_disables_background_download() -> Result<()> {
@@ -274,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn recording_gate_requires_oss_backend_and_enabled() {
+    fn recording_gate_uses_feature_enablement_for_all_backends() {
         fn startup_pack_config(enabled: bool) -> crate::cfg::SnapshotStartupPackConfig {
             crate::cfg::SnapshotStartupPackConfig {
                 enabled,
@@ -300,8 +642,8 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !recording_enabled_for(&posix_enabled),
-            "enabled=true with posix_fs backend must NOT record"
+            recording_enabled_for(&posix_enabled),
+            "enabled=true with posix_fs backend must record"
         );
 
         let oss_enabled = crate::cfg::SnapshotConfig {
@@ -323,5 +665,156 @@ mod tests {
             !recording_enabled_for(&oss_disabled),
             "enabled=false with oss backend must NOT record"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_prefetch_never_opens_invalid_paths() -> Result<()> {
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let missing = PathBuf::from("/definitely-missing-startup-layer");
+        let pack = crate::snapshot::ResolvedStartupPack {
+            source: crate::snapshot::startup_pack::ResolvedStartupPackSource::LocalPath(
+                missing.clone(),
+            ),
+            pack_size: 0,
+            mem_virtual_size: 0,
+            index_sha256: String::new(),
+        };
+        local_startup_prefetch(missing.clone(), missing, pack, cancelled).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_signals_and_joins_local_prefetch_task() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task_cancel = Arc::clone(&cancel);
+        let finished = Arc::new(AtomicBool::new(false));
+        let task_finished = Arc::clone(&finished);
+        let task = tokio::spawn(async move {
+            while !task_cancel.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            task_finished.store(true, Ordering::Release);
+        });
+        LocalStartupPrefetch { cancel, task }.stop().await;
+        assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn direct_io_skips_local_prefetch_before_manifest_access() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let global = tmp.path().join("overlaybd.json");
+        let config = overlaybd::config::GlobalConfig {
+            io_engine: 2,
+            ..Default::default()
+        };
+        tokio::fs::write(&global, serde_json::to_vec(&config)?).await?;
+        let missing = tmp.path().join("missing-manifest");
+        let pack = crate::snapshot::ResolvedStartupPack {
+            source: crate::snapshot::startup_pack::ResolvedStartupPackSource::LocalPath(
+                missing.clone(),
+            ),
+            pack_size: 1,
+            mem_virtual_size: 4096,
+            index_sha256: "x".to_owned(),
+        };
+        local_startup_prefetch(
+            tmp.path().join("missing-image-config"),
+            global,
+            pack,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_local_manifest_is_best_effort_and_does_not_fail_the_task() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let global = tmp.path().join("overlaybd.json");
+        tokio::fs::write(
+            &global,
+            serde_json::to_vec(&overlaybd::config::GlobalConfig::default())?,
+        )
+        .await?;
+        let manifest = tmp.path().join("memory-startup.pack");
+        let bytes = b"not a startup manifest";
+        tokio::fs::write(&manifest, bytes).await?;
+        let pack = crate::snapshot::ResolvedStartupPack {
+            source: crate::snapshot::startup_pack::ResolvedStartupPackSource::LocalPath(manifest),
+            pack_size: bytes.len() as u64,
+            mem_virtual_size: 4096,
+            index_sha256: crate::snapshot::startup_pack::hex_sha256(bytes),
+        };
+        let mut prefetch =
+            submit_local_startup_prefetch(tmp.path().join("missing-image-config"), global, pack);
+        (&mut prefetch.task)
+            .await
+            .expect("prefetch task must not panic");
+        Ok(())
+    }
+
+    #[test]
+    fn local_prefetch_dedup_keeps_remaining_subscriber_running() {
+        let key = format!("dedup-test-{}", uuid::Uuid::new_v4());
+        let (first, first_leader) = acquire_local_prefetch(key.clone());
+        let (second, second_leader) = acquire_local_prefetch(key);
+        assert!(first_leader);
+        assert!(!second_leader);
+        let first_lease = LocalPrefetchLease {
+            shared: Arc::clone(&first),
+            released: false,
+        };
+        let second_lease = LocalPrefetchLease {
+            shared: second,
+            released: false,
+        };
+        drop(first_lease);
+        assert!(
+            !first.cancel.load(Ordering::Acquire),
+            "one sandbox leaving must not cancel another subscriber"
+        );
+        drop(second_lease);
+        assert!(first.cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn local_prefetch_identity_includes_actual_layer_source() {
+        let layers = |path: &str| {
+            vec![overlaybd::pack_planner::FinalLayerSource {
+                digest: "sha256:layer".to_owned(),
+                size: 4096,
+                source: overlaybd::pack_planner::FinalLayerBytes::LocalPath(PathBuf::from(path)),
+            }]
+        };
+        assert_ne!(
+            local_prefetch_identity("pack", &layers("/repository-a/layer")),
+            local_prefetch_identity("pack", &layers("/repository-b/layer")),
+            "different local layers must not share a physical prefetch task"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_subscriber_waits_for_worker_to_finish_after_cancellation() {
+        let shared = Arc::new(SharedLocalPrefetch {
+            subscribers: std::sync::atomic::AtomicUsize::new(1),
+            cancel: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        });
+        let worker_shared = Arc::clone(&shared);
+        let worker = tokio::spawn(async move {
+            while !worker_shared.cancel.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            worker_shared.finished.store(true, Ordering::Release);
+        });
+        let mut lease = LocalPrefetchLease {
+            shared: Arc::clone(&shared),
+            released: false,
+        };
+        assert!(lease.release(), "sole subscriber must cancel the worker");
+        wait_for_local_prefetch_finished(&shared).await;
+        worker.await.expect("worker must not panic");
+        assert!(shared.finished.load(Ordering::Acquire));
     }
 }

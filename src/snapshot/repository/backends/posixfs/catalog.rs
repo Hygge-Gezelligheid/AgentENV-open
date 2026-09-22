@@ -12,8 +12,8 @@ use serde::Serialize;
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::snapshot::repository::{SnapshotListFilter, VolumeRecordPage};
 use crate::snapshot::{
-    CommittedSnapshot, RepositoryError, RepositoryResult, SnapshotAlias, SnapshotId,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
+    CommittedSnapshot, MemoryStartupPackInfo, RepositoryError, RepositoryResult, SnapshotAlias,
+    SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
     SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };
 use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord};
@@ -247,8 +247,8 @@ impl PosixFsCatalogStore {
     }
 
     pub(crate) fn delete_record(&self, id: &SnapshotId) -> RepositoryResult<()> {
+        let _record_guard = self.acquire_record_lock(id)?;
         let Some(record) = self.load_record_by_id_unlocked(id)? else {
-            // Idempotent: already doesn't exist
             return Ok(());
         };
         if let Some(alias) = record.alias.as_ref() {
@@ -680,6 +680,55 @@ impl PosixFsCatalogStore {
             return Err(RepositoryError::InvalidRequest {
                 reason: format!("invalid volume {kind} '{value}'"),
             });
+        }
+        Ok(())
+    }
+    /// Atomically persist a verified manifest and attach it only while the committed record exists.
+    pub(crate) fn attach_memory_startup(
+        &self,
+        id: &SnapshotId,
+        info: MemoryStartupPackInfo,
+        bytes: &[u8],
+    ) -> RepositoryResult<()> {
+        let _guard = self.acquire_record_lock(id)?;
+        let Some(mut record) = self.load_record_by_id_unlocked(id)? else {
+            return Ok(());
+        };
+        let Some(committed) = record.committed.as_mut() else {
+            return Ok(());
+        };
+        if committed.memory_startup.is_some() {
+            return Ok(());
+        }
+        let path = self
+            .layout(id)
+            .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
+        let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
+            message: format!("resolve parent for {}", path.display()),
+            source: None,
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            RepositoryError::backend(format!("create {}", parent.display()), error)
+        })?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+            RepositoryError::backend(
+                format!("create manifest temp in {}", parent.display()),
+                error,
+            )
+        })?;
+        temp.write_all(bytes)
+            .and_then(|()| temp.as_file().sync_all())
+            .map_err(|error| {
+                RepositoryError::backend(format!("write manifest {}", path.display()), error)
+            })?;
+        temp.persist(&path).map_err(|error| {
+            RepositoryError::backend(format!("persist manifest {}", path.display()), error.error)
+        })?;
+        committed.memory_startup = Some(info);
+        record.updated_at_unix_ms = now_unix_ms();
+        if let Err(error) = self.write_record_unlocked(&record) {
+            let _ = fs::remove_file(&path);
+            return Err(error);
         }
         Ok(())
     }
@@ -1150,8 +1199,9 @@ mod tests {
     use super::PosixFsCatalogStore;
     use crate::snapshot::RepositoryError;
     use crate::snapshot::{
-        CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotPublishMetadata,
-        SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind, TemplateBuildStatus,
+        CommittedSnapshot, MemoryStartupPackInfo, SnapshotAlias, SnapshotId, SnapshotListFilter,
+        SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind,
+        TemplateBuildStatus,
     };
     use crate::volume::{VolumeMode, VolumeRecord};
 
@@ -1265,6 +1315,101 @@ mod tests {
             .commit_publish(&session, metadata, CommittedSnapshot::mock())
             .expect("commit should work");
         snapshot_id
+    }
+
+    #[test]
+    fn startup_manifest_attach_is_idempotent_and_cannot_revive_a_delete() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = PosixFsCatalogStore::new(root.clone());
+        let id = SnapshotId::generate();
+        let session = store.begin_publish(&id).unwrap();
+        store
+            .commit_publish(
+                &session,
+                SnapshotPublishMetadata {
+                    id: id.clone(),
+                    source: SnapshotPublishSource::Template,
+                    ..SnapshotPublishMetadata::mock()
+                },
+                CommittedSnapshot::mock(),
+            )
+            .unwrap();
+        let first = MemoryStartupPackInfo {
+            pack_size: 11,
+            mem_virtual_size: 4096,
+            index_sha256: "first".to_owned(),
+        };
+        store
+            .attach_memory_startup(&id, first.clone(), b"manifest-v1")
+            .unwrap();
+        let artifact = PosixFsSnapshotArtifactLayout::new(&root, &id)
+            .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"manifest-v1");
+        store
+            .attach_memory_startup(
+                &id,
+                MemoryStartupPackInfo {
+                    pack_size: 12,
+                    mem_virtual_size: 8192,
+                    index_sha256: "second".to_owned(),
+                },
+                b"manifest-v2",
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"manifest-v1");
+        assert_eq!(
+            store
+                .get(&id.to_string())
+                .unwrap()
+                .unwrap()
+                .committed
+                .unwrap()
+                .memory_startup,
+            Some(first)
+        );
+
+        let race_id = SnapshotId::generate();
+        let race_session = store.begin_publish(&race_id).unwrap();
+        store
+            .commit_publish(
+                &race_session,
+                SnapshotPublishMetadata {
+                    id: race_id.clone(),
+                    source: SnapshotPublishSource::Template,
+                    ..SnapshotPublishMetadata::mock()
+                },
+                CommittedSnapshot::mock(),
+            )
+            .unwrap();
+        let attach_root = root.clone();
+        let delete_root = root.clone();
+        let attach_id = race_id.clone();
+        let delete_id = race_id.clone();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                PosixFsCatalogStore::new(attach_root)
+                    .attach_memory_startup(
+                        &attach_id,
+                        MemoryStartupPackInfo {
+                            pack_size: 4,
+                            mem_virtual_size: 4096,
+                            index_sha256: "race".to_owned(),
+                        },
+                        b"race",
+                    )
+                    .unwrap();
+            });
+            scope.spawn(move || {
+                PosixFsCatalogStore::new(delete_root)
+                    .delete_record(&delete_id)
+                    .unwrap();
+            });
+        });
+        assert!(store.get(&race_id.to_string()).unwrap().is_none());
+        assert!(!PosixFsSnapshotArtifactLayout::new(&root, &race_id)
+            .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT)
+            .exists());
     }
 
     fn listed_ids(store: &PosixFsCatalogStore, filter: SnapshotListFilter) -> Vec<SnapshotId> {

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::task;
+use tracing::{debug, warn};
 
 use super::super::{common::materialize_volume_image_config, shared_runtime_cache_root};
 use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
@@ -241,6 +242,65 @@ impl PosixFsSnapshotRepository {
         self.catalog_store.mark_error(id, reason)
     }
 }
+async fn finish_posix_startup_manifest(
+    catalog: Arc<PosixFsCatalogStore>,
+    id: SnapshotId,
+    recording: crate::snapshot::StartupRecording,
+) {
+    let crate::snapshot::StartupRecording { trace, keep_alive } = recording;
+    let _keep_alive = keep_alive;
+    let _guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::new();
+    let trace_path = match tokio::select! { joined = trace => joined, _ = crate::snapshot::startup_pack::startup_manifest_abort_notify() => return }
+    {
+        Ok(Some(path)) => path,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "POSIX startup trace join failed");
+            return;
+        }
+    };
+    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+        return;
+    }
+    let bytes = match tokio::fs::read(&trace_path).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            debug!(%error, snapshot_id = %id, "POSIX startup trace unavailable");
+            return;
+        }
+    };
+    let (memory_size, offsets) = match overlaybd::startup_pack::decode_trace(&bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "POSIX startup trace invalid");
+            return;
+        }
+    };
+    let manifest = match overlaybd::startup_manifest::build_manifest(memory_size, &offsets)
+        .and_then(|manifest| overlaybd::startup_manifest::encode_manifest(&manifest))
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "POSIX startup manifest build failed");
+            return;
+        }
+    };
+    let info = crate::snapshot::MemoryStartupPackInfo {
+        pack_size: manifest.len() as u64,
+        mem_virtual_size: memory_size,
+        index_sha256: crate::snapshot::startup_pack::hex_sha256(&manifest),
+    };
+    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+        return;
+    }
+    let attached = run_repository_blocking("attach POSIX startup manifest", move || {
+        catalog.attach_memory_startup(&id, info, &manifest)
+    })
+    .await;
+    if let Err(error) = attached {
+        warn!(%error, "POSIX startup manifest attach failed");
+    }
+}
 
 #[async_trait]
 impl SnapshotRepository for PosixFsSnapshotRepository {
@@ -256,13 +316,26 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         &self,
         metadata: SnapshotPublishMetadata,
         manifest: SandboxSnapshotManifest,
-        _recording: Option<crate::snapshot::StartupRecording>,
+        recording: Option<crate::snapshot::StartupRecording>,
     ) -> RepositoryResult<SnapshotRecord> {
+        let id = metadata.id.clone();
+        let catalog = Arc::clone(&self.catalog_store);
         let repository = self.clone();
-        run_repository_blocking("publish snapshot", move || {
+        let record = run_repository_blocking("publish snapshot", move || {
             repository.publish_sync(metadata, manifest)
         })
-        .await
+        .await?;
+        if crate::cfg::ConfigManager::global_config()
+            .snapshot
+            .memory_startup_pack
+            .enabled
+            && !crate::snapshot::startup_pack::startup_manifest_shutdown_requested()
+        {
+            if let Some(recording) = recording {
+                tokio::spawn(finish_posix_startup_manifest(catalog, id, recording));
+            }
+        }
+        Ok(record)
     }
 
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {

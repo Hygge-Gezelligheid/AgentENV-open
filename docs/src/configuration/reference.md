@@ -437,6 +437,35 @@ local raw layers whose digest is absent from the committed record — the
 record names the compressed bytes, so the raw digest key would never be
 looked up by consumers.
 
+
+## `[snapshot.memory_startup_pack]`
+
+Optional startup-memory trace recording and best-effort prefetch for both
+`oss` and `posix_fs` repositories. It is disabled by default. Publishing never
+waits for recording: a completed trace is encoded as a SHA-256-verified
+manifest and attached to the already committed snapshot. Snapshots without a
+descriptor, with a missing/corrupt manifest, or with a failed prefetch always
+resume through the ordinary on-demand path.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Record a first-touch trace after capture and persist a manifest when recording succeeds. |
+| `record_min_window_ms` | integer | `200` | Minimum recorder observation window after its first read. |
+| `record_quiet_ms` | integer | `300` | Stop recording after this quiet interval. |
+| `record_max_window_ms` | integer | `2000` | Hard recorder observation-window cap. |
+| `record_budget_secs` | integer | `10` | Best-effort recording budget; it never blocks the snapshot publish. |
+| `max_pack_bytes` | integer | `1073741824` | Maximum recorded page-data budget and local planner budget. |
+| `consume_enabled` | boolean | `false` | Enable resume-time prefetch; leave disabled for rollout and A/B comparisons. |
+| `consume_timeout_secs` | integer | `30` | Bound a prefetch run, including its shared read queue. |
+
+For POSIX, the resolver hands the normal sandbox start path a `LocalPath`
+manifest. The executor uses buffered reads to warm the page cache, globally
+limits concurrent reads to four, and deduplicates matching in-flight work by
+manifest digest plus final layer identities. `O_DIRECT` (`io_engine = 2`) skips
+the local prefetch deliberately, because it bypasses the page cache; it does
+not alter the configured I/O engine. This feature is a latency optimization,
+not a correctness dependency.
+
 ## `[backend.posix_fs]`
 
 POSIX filesystem-backed snapshot repository configuration. This section is used when `snapshot.repository_backend = "posix_fs"`.
