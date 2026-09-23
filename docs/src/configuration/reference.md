@@ -454,17 +454,25 @@ resume through the ordinary on-demand path.
 | `record_quiet_ms` | integer | `300` | Stop recording after this quiet interval. |
 | `record_max_window_ms` | integer | `2000` | Hard recorder observation-window cap. |
 | `record_budget_secs` | integer | `10` | Best-effort recording budget; it never blocks the snapshot publish. |
-| `max_pack_bytes` | integer | `1073741824` | Maximum recorded page-data budget and local planner budget. |
+| `max_pack_bytes` | integer | `1073741824` | Maximum recorded page-data budget and POSIX logical prefetch budget. |
 | `consume_enabled` | boolean | `false` | Enable resume-time prefetch; leave disabled for rollout and A/B comparisons. |
 | `consume_timeout_secs` | integer | `30` | Bound a prefetch run, including its shared read queue. |
 
 For POSIX, the resolver hands the normal sandbox start path a `LocalPath`
-manifest. The executor uses buffered reads to warm the page cache, globally
-limits concurrent reads to four, and deduplicates matching in-flight work by
-manifest digest plus final layer identities. `O_DIRECT` (`io_engine = 2`) skips
-the local prefetch deliberately, because it bypasses the page cache; it does
-not alter the configured I/O engine. This feature is a latency optimization,
-not a correctness dependency.
+manifest. After acquiring the actual shared memory ublk device, the executor
+reads its logical manifest ranges through a buffered device handle, concurrently
+with recovery. This warms the device page cache used by Firecracker, rather
+than the separate cache of lower-layer files. Each run uses one reader and a
+1 MiB buffer; at most four readers run process-wide. In-flight sharing includes
+the manifest digest, layer identities, and live device generation.
+
+Cancellation and the time budget stop dispatch of subsequent reads. An already
+executing kernel read cannot be interrupted: teardown drains it before releasing
+the device lease, so a stalled storage read can delay teardown. `O_DIRECT`
+(`io_engine = 2`) remains explicitly skipped pending validation of that lower-I/O
+configuration with device prefetch; this is not a claim that device page cache
+is bypassed. The configured I/O engine is never changed. OSS retains its existing
+physical-range planner and executor. Prefetch is not a correctness dependency.
 
 ## `[backend.posix_fs]`
 

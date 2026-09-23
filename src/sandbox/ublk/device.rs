@@ -837,6 +837,12 @@ pub(crate) struct SharedReadOnlyDevice {
 }
 
 impl SharedReadOnlyDevice {
+    /// Identity of this live device generation, not a recyclable kernel ID.
+    /// The caller must retain a clone while using this identity.
+    pub(crate) fn prefetch_identity(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
     pub fn image_config_path(&self) -> &Path {
         &self.inner.image_config_key
     }
@@ -869,7 +875,6 @@ impl SharedReadOnlyDevice {
         release_shared_readonly_device(key, device, notify).await
     }
 }
-
 /// A handle to a single `/dev/ublkb<N>` device.
 ///
 /// This is a pure data struct. All lifecycle operations (create, delete,

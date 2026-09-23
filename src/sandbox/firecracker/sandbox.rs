@@ -1402,13 +1402,12 @@ impl FirecrackerSandbox {
     pub async fn stop(&mut self) -> Result<()> {
         debug!("stopping firecracker sandbox");
 
-        if let Some(task) = self.startup_prefetch_task.take() {
-            task.stop().await;
-        }
-
-        self.fc_instance
-            .stop(self.runtime_policy.socket_timeout)
-            .await?;
+        let prefetch = self.startup_prefetch_task.take();
+        super::startup_pack::stop_vm_after_prefetch_cancel(
+            prefetch.as_ref(),
+            self.fc_instance.stop(self.runtime_policy.socket_timeout),
+        )
+        .await?;
 
         // Clear envd instance
         if let Some(envd) = self.envd_instance.as_ref() {
@@ -1434,12 +1433,6 @@ impl FirecrackerSandbox {
                 warn!(error = %error, "failed to release shared tools device during stop");
             }
         }
-        if let Some(mem_device) = self.mem_ublk_device.take() {
-            if let Err(e) = mem_device.release().await {
-                warn!(error = %e, "failed to release shared memory ublk device during stop");
-            }
-        }
-
         // Dedicated pack-recording memory device: delete, never pool-release.
         if let Some(device) = self.mem_dedicated_device.take() {
             if let Err(e) = UblkDeviceManager::global().delete_device(&device).await {
@@ -1463,12 +1456,31 @@ impl FirecrackerSandbox {
         }
 
         // Cleanup network resources
+        let mut network_error = None;
         if let Some(slot) = self.network_slot.take() {
             let idx = slot.idx;
-            NetworkManager::global()
+            match NetworkManager::global()
                 .release(slot)
-                .context("Failed to release network slot")?;
-            debug!(slot = idx, "network slot released");
+                .context("Failed to release network slot")
+            {
+                Ok(()) => debug!(slot = idx, "network slot released"),
+                Err(error) => network_error = Some(error),
+            }
+        }
+
+        // The reader retains its own shared-device lease. Stop the VM and
+        // release unrelated resources first; only the final memory-device
+        // release waits for a possibly blocked in-kernel prefetch read.
+        if let Some(task) = prefetch {
+            task.stop().await;
+        }
+        if let Some(mem_device) = self.mem_ublk_device.take() {
+            if let Err(error) = mem_device.release().await {
+                warn!(%error, "failed to release shared memory ublk device during stop");
+            }
+        }
+        if let Some(error) = network_error {
+            return Err(error);
         }
 
         debug!("firecracker sandbox stopped");
@@ -2212,15 +2224,8 @@ impl FirecrackerSandbox {
                             .await;
                     }
                     crate::snapshot::ResolvedStartupPackSource::LocalPath(_) => {
-                        if let Some(task) = self.startup_prefetch_task.take() {
-                            task.stop().await;
-                        }
-                        self.startup_prefetch_task =
-                            Some(super::startup_pack::submit_local_startup_prefetch(
-                                config.mem_overlaybd_config.image_config_path.clone(),
-                                mem_global_config.clone(),
-                                pack.clone(),
-                            ));
+                        // Local prefetch needs the actual shared memory device,
+                        // acquired below. Warming lower files is insufficient.
                     }
                 }
             }
@@ -2235,6 +2240,24 @@ impl FirecrackerSandbox {
                 .await
                 .context("create or reuse shared memory ublk device for resume")?;
             let device_path = mem_device.device_path().to_path_buf();
+
+            if let Some(pack) = &config.memory_startup_pack {
+                if matches!(
+                    &pack.source,
+                    crate::snapshot::ResolvedStartupPackSource::LocalPath(_)
+                ) {
+                    if let Some(task) = self.startup_prefetch_task.take() {
+                        task.stop().await;
+                    }
+                    self.startup_prefetch_task =
+                        Some(super::startup_pack::submit_local_startup_prefetch(
+                            mem_device.clone(),
+                            config.mem_overlaybd_config.image_config_path.clone(),
+                            mem_global_config.clone(),
+                            pack.clone(),
+                        ));
+                }
+            }
 
             self.mem_snapshot_image_config_path =
                 Some(config.mem_overlaybd_config.image_config_path.clone());
