@@ -27,8 +27,7 @@ pub struct StartupRecording {
 
 // ── Shutdown coordination for detached manifest work ────────────────────────
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Process-global coordination for detached startup-manifest work. Graceful
 /// shutdown first stops NEW continuations from spawning, then drains the
@@ -36,79 +35,114 @@ use std::sync::OnceLock;
 /// instead of being canceled outright. Only a drain timeout force-cancels
 /// what is left.
 struct StartupManifestShutdown {
-    stop_new: AtomicBool,
-    abort: AtomicBool,
-    abort_notify: tokio::sync::Notify,
-    in_flight: AtomicUsize,
-    drained_notify: tokio::sync::Notify,
+    state: Mutex<StartupManifestShutdownState>,
+    abort: tokio::sync::watch::Sender<bool>,
+    in_flight: tokio::sync::watch::Sender<usize>,
 }
 
-fn startup_manifest_shutdown() -> &'static StartupManifestShutdown {
-    static SHUTDOWN: OnceLock<StartupManifestShutdown> = OnceLock::new();
-    SHUTDOWN.get_or_init(|| StartupManifestShutdown {
-        stop_new: AtomicBool::new(false),
-        abort: AtomicBool::new(false),
-        abort_notify: tokio::sync::Notify::new(),
-        in_flight: AtomicUsize::new(0),
-        drained_notify: tokio::sync::Notify::new(),
-    })
+#[derive(Default)]
+struct StartupManifestShutdownState {
+    stop_new: bool,
+    abort: bool,
+    in_flight: usize,
+}
+
+impl StartupManifestShutdown {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(StartupManifestShutdownState::default()),
+            abort: tokio::sync::watch::channel(false).0,
+            in_flight: tokio::sync::watch::channel(0).0,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, StartupManifestShutdownState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn try_register(self: &Arc<Self>) -> Option<StartupManifestTaskGuard> {
+        let mut state = self.lock();
+        if state.stop_new {
+            return None;
+        }
+        state.in_flight += 1;
+        self.in_flight.send_replace(state.in_flight);
+        Some(StartupManifestTaskGuard {
+            state: Arc::clone(self),
+        })
+    }
+
+    async fn drain(&self, timeout: std::time::Duration) {
+        let mut receiver = self.in_flight.subscribe();
+        self.lock().stop_new = true;
+        let drained = async {
+            while *receiver.borrow_and_update() != 0 {
+                if receiver.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        if tokio::time::timeout(timeout, drained).await.is_err() {
+            let mut inner = self.lock();
+            if inner.in_flight != 0 {
+                inner.abort = true;
+                self.abort.send_replace(true);
+            }
+        }
+    }
+}
+
+fn startup_manifest_shutdown() -> &'static Arc<StartupManifestShutdown> {
+    static SHUTDOWN: OnceLock<Arc<StartupManifestShutdown>> = OnceLock::new();
+    SHUTDOWN.get_or_init(|| Arc::new(StartupManifestShutdown::new()))
 }
 
 /// True once shutdown was requested: the publish flow must not spawn new
 /// startup-manifest continuations after this point.
 pub fn startup_manifest_shutdown_requested() -> bool {
-    startup_manifest_shutdown().stop_new.load(Ordering::SeqCst)
+    startup_manifest_shutdown().lock().stop_new
 }
 
 /// True once the drain timed out and remaining work was told to cancel.
 pub fn startup_manifest_abort_requested() -> bool {
-    startup_manifest_shutdown().abort.load(Ordering::SeqCst)
+    startup_manifest_shutdown().lock().abort
 }
 
 /// Notified once [`startup_manifest_abort_requested`] turns true.
-pub fn startup_manifest_abort_notify() -> tokio::sync::futures::Notified<'static> {
-    startup_manifest_shutdown().abort_notify.notified()
+pub async fn startup_manifest_abort_notify() {
+    let mut receiver = startup_manifest_shutdown().abort.subscribe();
+    while !*receiver.borrow_and_update() {
+        if receiver.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Request shutdown: stop spawning new startup-manifest continuations, then
 /// wait (bounded by `timeout`) for the in-flight ones to drain so their
 /// manifests still land. Whatever survives the timeout is force-canceled.
 pub async fn drain_startup_manifest_tasks(timeout: std::time::Duration) {
-    let state = startup_manifest_shutdown();
-    state.stop_new.store(true, Ordering::SeqCst);
-    let drained = async {
-        while state.in_flight.load(Ordering::SeqCst) != 0 {
-            state.drained_notify.notified().await;
-        }
-    };
-    if tokio::time::timeout(timeout, drained).await.is_err()
-        && state.in_flight.load(Ordering::SeqCst) != 0
-    {
-        state.abort.store(true, Ordering::SeqCst);
-        state.abort_notify.notify_waiters();
-    }
+    startup_manifest_shutdown().drain(timeout).await;
 }
 
 /// RAII guard counting one in-flight startup-manifest continuation.
 pub(crate) struct StartupManifestTaskGuard {
-    _private: (),
+    state: Arc<StartupManifestShutdown>,
 }
 
 impl StartupManifestTaskGuard {
-    pub(crate) fn new() -> Self {
-        startup_manifest_shutdown()
-            .in_flight
-            .fetch_add(1, Ordering::SeqCst);
-        Self { _private: () }
+    pub(crate) fn try_register() -> Option<Self> {
+        startup_manifest_shutdown().try_register()
     }
 }
 
 impl Drop for StartupManifestTaskGuard {
     fn drop(&mut self) {
-        let state = startup_manifest_shutdown();
-        if state.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
-            state.drained_notify.notify_waiters();
-        }
+        let mut inner = self.state.lock();
+        inner.in_flight -= 1;
+        self.state.in_flight.send_replace(inner.in_flight);
     }
 }
 
@@ -128,7 +162,8 @@ pub struct MemoryStartupPackInfo {
 
 /// Runtime-only startup pack reference handed from a repository resolver to
 /// sandbox start. The source explicitly distinguishes OSS URLs from local
-/// POSIX paths. Never trusted on its own — the consumer verifies the pack's
+/// POSIX paths. Never trusted on its own: the consumer verifies the pack's
+/// size, digest and memory geometry before use.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolvedStartupPackSource {
     OssUrl(String),
@@ -196,6 +231,47 @@ pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_admission_and_abort_are_race_free() {
+        let coordinator = Arc::new(StartupManifestShutdown::new());
+        let guard = coordinator
+            .try_register()
+            .expect("admitted before shutdown");
+        let mut in_flight = coordinator.in_flight.subscribe();
+        coordinator.drain(std::time::Duration::ZERO).await;
+        assert!(coordinator.try_register().is_none());
+        assert_eq!(*in_flight.borrow_and_update(), 1);
+        let mut abort = coordinator.abort.subscribe();
+        assert!(
+            *abort.borrow_and_update(),
+            "late subscriber sees prior abort"
+        );
+        drop(guard);
+        in_flight
+            .changed()
+            .await
+            .expect("guard release is observable");
+        assert_eq!(*in_flight.borrow_and_update(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_observes_last_guard_release_without_lost_notification() {
+        let coordinator = Arc::new(StartupManifestShutdown::new());
+        let guard = coordinator.try_register().expect("admitted");
+        let draining = Arc::clone(&coordinator);
+        let task = tokio::spawn(async move {
+            draining.drain(std::time::Duration::from_secs(1)).await;
+        });
+        while !coordinator.lock().stop_new {
+            tokio::task::yield_now().await;
+        }
+        assert!(coordinator.try_register().is_none());
+        drop(guard);
+        task.await.expect("drain task");
+        assert_eq!(coordinator.lock().in_flight, 0);
+        assert!(!coordinator.lock().abort);
+    }
 
     #[test]
     fn committed_snapshot_without_memory_startup_deserializes() {

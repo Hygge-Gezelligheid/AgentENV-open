@@ -246,12 +246,22 @@ async fn finish_posix_startup_manifest(
     catalog: Arc<PosixFsCatalogStore>,
     id: SnapshotId,
     recording: crate::snapshot::StartupRecording,
+    _guard: crate::snapshot::startup_pack::StartupManifestTaskGuard,
 ) {
-    let crate::snapshot::StartupRecording { trace, keep_alive } = recording;
+    let crate::snapshot::StartupRecording {
+        mut trace,
+        keep_alive,
+    } = recording;
     let _keep_alive = keep_alive;
-    let _guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::new();
-    let trace_path = match tokio::select! { joined = trace => joined, _ = crate::snapshot::startup_pack::startup_manifest_abort_notify() => return }
-    {
+    let trace_path = match tokio::select! {
+        joined = &mut trace => joined,
+        _ = crate::snapshot::startup_pack::startup_manifest_abort_notify() => {
+            // The recorder owns a VM/device cleanup path. Keep its capture
+            // lease until it has actually finished, even during shutdown.
+            let _ = trace.await;
+            return;
+        }
+    } {
         Ok(Some(path)) => path,
         Ok(None) => return,
         Err(error) => {
@@ -262,33 +272,49 @@ async fn finish_posix_startup_manifest(
     if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
         return;
     }
-    let bytes = match tokio::fs::read(&trace_path).await {
+    use tokio::io::AsyncReadExt;
+    let max_trace_bytes = overlaybd::startup_pack::TRACE_HEADER_BYTES
+        + overlaybd::startup_pack::MAX_TRACE_PAGES as usize * 8;
+    let bytes = match async {
+        let mut file = tokio::fs::File::open(&trace_path).await?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(max_trace_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        anyhow::ensure!(bytes.len() <= max_trace_bytes, "startup trace too large");
+        Ok::<_, anyhow::Error>(bytes)
+    }
+    .await
+    {
         Ok(bytes) => bytes,
         Err(error) => {
             debug!(%error, snapshot_id = %id, "POSIX startup trace unavailable");
             return;
         }
     };
-    let (memory_size, offsets) = match overlaybd::startup_pack::decode_trace(&bytes) {
-        Ok(value) => value,
+    let built = tokio::task::spawn_blocking(move || {
+        let (memory_size, offsets) = overlaybd::startup_pack::decode_trace(&bytes)?;
+        let manifest = overlaybd::startup_manifest::build_manifest(memory_size, &offsets)?;
+        let bytes = overlaybd::startup_manifest::encode_manifest(&manifest)?;
+        let info = crate::snapshot::MemoryStartupPackInfo {
+            pack_size: bytes.len() as u64,
+            mem_virtual_size: memory_size,
+            index_sha256: crate::snapshot::startup_pack::hex_sha256(&bytes),
+        };
+        Ok::<_, anyhow::Error>((info, bytes))
+    })
+    .await;
+    let (info, manifest) = match built {
+        Ok(Ok(result)) => result,
         Err(error) => {
-            warn!(%error, snapshot_id = %id, "POSIX startup trace invalid");
+            warn!(%error, snapshot_id = %id, "POSIX startup manifest builder failed");
             return;
         }
-    };
-    let manifest = match overlaybd::startup_manifest::build_manifest(memory_size, &offsets)
-        .and_then(|manifest| overlaybd::startup_manifest::encode_manifest(&manifest))
-    {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            warn!(%error, snapshot_id = %id, "POSIX startup manifest build failed");
+        Ok(Err(error)) => {
+            warn!(%error, snapshot_id = %id, "POSIX startup manifest invalid");
             return;
         }
-    };
-    let info = crate::snapshot::MemoryStartupPackInfo {
-        pack_size: manifest.len() as u64,
-        mem_virtual_size: memory_size,
-        index_sha256: crate::snapshot::startup_pack::hex_sha256(&manifest),
     };
     if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
         return;
@@ -329,10 +355,18 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
             .snapshot
             .memory_startup_pack
             .enabled
-            && !crate::snapshot::startup_pack::startup_manifest_shutdown_requested()
         {
             if let Some(recording) = recording {
-                tokio::spawn(finish_posix_startup_manifest(catalog, id, recording));
+                if let Some(guard) =
+                    crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()
+                {
+                    tokio::spawn(finish_posix_startup_manifest(catalog, id, recording, guard));
+                } else {
+                    // During shutdown, keep capture artifacts alive until the
+                    // already-started recorder has completed its own cleanup.
+                    let _ = recording.trace.await;
+                    drop(recording.keep_alive);
+                }
             }
         }
         Ok(record)
@@ -550,7 +584,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::runtime::PosixFsRuntimeResolver;
-    use super::{PosixFsBackend, PosixFsBackendConfig, PosixFsSnapshotRepository};
+    use super::{
+        finish_posix_startup_manifest, PosixFsBackend, PosixFsBackendConfig,
+        PosixFsSnapshotRepository,
+    };
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
     use crate::sandbox::{ExtraDrive, SandboxSnapshotManifest};
     use crate::snapshot::artifact_cache::LocalArtifactCache;
@@ -698,6 +735,81 @@ mod tests {
         .expect("parse overlaybd image config");
         assert_eq!(image_config.repo_blob_url, "");
         assert_eq!(image_config.lowers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let backend = test_backend(tempdir.path());
+        let repository = backend.repository();
+        let snapshot_id = SnapshotId::generate();
+        let mut local_artifacts = seed_built_snapshot(tempdir.path());
+        let memory_size = overlaybd::startup_pack::PACK_PAGE_BYTES;
+        local_artifacts.memory.virtual_size = memory_size;
+        repository
+            .publish(
+                sample_metadata(snapshot_id.clone(), None),
+                local_artifacts,
+                None,
+            )
+            .await
+            .expect("publish");
+
+        let trace_path = tempdir.path().join("synthetic.trace");
+        let trace = overlaybd::startup_pack::encode_trace(memory_size, &[0]).expect("trace");
+        tokio::fs::write(&trace_path, trace)
+            .await
+            .expect("write trace");
+        let recording = crate::snapshot::StartupRecording {
+            trace: tokio::spawn(async move { Some(trace_path) }),
+            keep_alive: Box::new(()),
+        };
+        let guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()
+            .expect("register continuation");
+        finish_posix_startup_manifest(
+            Arc::new(PosixFsCatalogStore::new(tempdir.path().to_path_buf())),
+            snapshot_id.clone(),
+            recording,
+            guard,
+        )
+        .await;
+
+        let committed = repository
+            .get(&snapshot_id.to_string())
+            .await
+            .expect("get")
+            .expect("published record");
+        let descriptor = committed
+            .committed
+            .as_ref()
+            .and_then(|value| value.memory_startup.as_ref())
+            .expect("descriptor attached")
+            .clone();
+        let resolver = PosixFsRuntimeResolver::new(
+            tempdir.path().to_path_buf(),
+            tempdir.path().join("runtime-consume"),
+            test_overlaybd_layer_store(),
+            LocalArtifactCache::new(tempdir.path().join("cache-consume"), None)
+                .expect("local cache"),
+        )
+        .with_test_consume_enabled(true);
+        let runnable = resolver
+            .resolve(Arc::new(committed))
+            .await
+            .expect("resolve");
+        let pack = runnable
+            .manifest()
+            .memory_startup_pack
+            .as_ref()
+            .expect("LocalPath manifest");
+        let crate::snapshot::ResolvedStartupPackSource::LocalPath(path) = &pack.source else {
+            panic!("expected LocalPath");
+        };
+        assert_eq!(pack.index_sha256, descriptor.index_sha256);
+        assert_eq!(
+            std::fs::read(path).unwrap().len() as u64,
+            descriptor.pack_size
+        );
     }
 
     #[tokio::test]

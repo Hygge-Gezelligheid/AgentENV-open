@@ -293,8 +293,21 @@ const LOCAL_PREFETCH_MAX_READS: usize = 4;
 
 struct SharedLocalPrefetch {
     subscribers: std::sync::atomic::AtomicUsize,
+    active_parts: std::sync::atomic::AtomicUsize,
     cancel: AtomicBool,
     finished: AtomicBool,
+}
+
+/// Completion is published only after both the async supervisor and any
+/// in-kernel blocking reader have exited, including panic/cancellation paths.
+struct LocalPrefetchCompletion(Arc<SharedLocalPrefetch>);
+
+impl Drop for LocalPrefetchCompletion {
+    fn drop(&mut self) {
+        if self.0.active_parts.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.finished.store(true, Ordering::Release);
+        }
+    }
 }
 
 struct LocalPrefetchLease {
@@ -315,7 +328,7 @@ impl LocalPrefetchLease {
         self.released = true;
         let mut runs = local_prefetches()
             .lock()
-            .expect("local prefetch registry poisoned");
+            .unwrap_or_else(|poison| poison.into_inner());
         if self.shared.subscribers.fetch_sub(1, Ordering::AcqRel) != 1 {
             return false;
         }
@@ -361,7 +374,7 @@ fn local_prefetch_read_permits() -> &'static Arc<tokio::sync::Semaphore> {
 fn acquire_local_prefetch(identity: String) -> (Arc<SharedLocalPrefetch>, bool) {
     let mut runs = local_prefetches()
         .lock()
-        .expect("local prefetch registry poisoned");
+        .unwrap_or_else(|poison| poison.into_inner());
     runs.retain(|_, run| run.strong_count() != 0);
     if let Some(shared) = runs.get(&identity).and_then(std::sync::Weak::upgrade) {
         if !shared.cancel.load(Ordering::Acquire) && !shared.finished.load(Ordering::Acquire) {
@@ -372,6 +385,7 @@ fn acquire_local_prefetch(identity: String) -> (Arc<SharedLocalPrefetch>, bool) 
     }
     let shared = Arc::new(SharedLocalPrefetch {
         subscribers: std::sync::atomic::AtomicUsize::new(1),
+        active_parts: std::sync::atomic::AtomicUsize::new(1),
         cancel: AtomicBool::new(false),
         finished: AtomicBool::new(false),
     });
@@ -469,12 +483,15 @@ async fn local_startup_prefetch_inner(
     };
     if leader {
         let worker = Arc::clone(&shared);
+        let completion = LocalPrefetchCompletion(Arc::clone(&worker));
         tokio::spawn(async move {
+            let _completion = completion;
             finish_local_prefetch_worker(Arc::clone(&worker), async {
                 let result = execute_device_prefetch(
                     prepared,
                     device.device_path().to_path_buf(),
                     Arc::clone(&worker),
+                    Some(device.clone()),
                 )
                 .await;
                 let released = device.release().await;
@@ -516,7 +533,26 @@ async fn prepare_local_prefetch(
         warn!(path = %manifest_path.display(), "skipping memory device startup prefetch: lower O_DIRECT configuration is not yet validated");
         return Ok(None);
     }
-    let bytes = tokio::fs::read(&manifest_path).await?;
+    let max_manifest_bytes = overlaybd::startup_manifest::MANIFEST_HEADER_BYTES
+        + overlaybd::startup_manifest::MAX_PREFIX_PAGES as usize * 8
+        + overlaybd::startup_manifest::MAX_RANGES as usize * 16;
+    anyhow::ensure!(
+        pack.pack_size <= max_manifest_bytes as u64,
+        "startup manifest descriptor exceeds format limit"
+    );
+    // Limit bytes actually read, not just pre-read metadata: a local file may
+    // grow after a metadata check and must not cause unbounded allocation.
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(&manifest_path).await?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(max_manifest_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    anyhow::ensure!(
+        bytes.len() <= max_manifest_bytes,
+        "startup manifest exceeds format limit"
+    );
     if subscriber_cancel.load(Ordering::Acquire) {
         return Ok(None);
     }
@@ -580,6 +616,7 @@ async fn execute_device_prefetch(
     prepared: PreparedLocalPrefetch,
     path: PathBuf,
     shared: Arc<SharedLocalPrefetch>,
+    device_lease: Option<SharedReadOnlyDevice>,
 ) -> Result<()> {
     let deadline = prepared.deadline;
     let spans = device_prefetch_spans(&prepared.manifest, prepared.max_pack_bytes);
@@ -597,7 +634,11 @@ async fn execute_device_prefetch(
         }
     };
     let worker_shared = Arc::clone(&shared);
+    shared.active_parts.fetch_add(1, Ordering::AcqRel);
+    let completion = LocalPrefetchCompletion(Arc::clone(&shared));
     let worker = tokio::task::spawn_blocking(move || {
+        let _completion = completion;
+        let _device_lease = device_lease;
         let _permit = permit;
         read_device_prefetch_spans(&path, &spans, deadline, &worker_shared)
     });
@@ -696,7 +737,7 @@ fn read_device_prefetch_spans_with(
     Ok(read_bytes)
 }
 
-async fn finish_local_prefetch_worker<F>(shared: Arc<SharedLocalPrefetch>, execution: F)
+async fn finish_local_prefetch_worker<F>(_shared: Arc<SharedLocalPrefetch>, execution: F)
 where
     F: std::future::Future<Output = Result<()>>,
 {
@@ -704,7 +745,6 @@ where
         Ok(()) => {}
         Err(error) => warn!(%error, "local startup manifest prefetch failed"),
     }
-    shared.finished.store(true, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -715,9 +755,26 @@ mod tests {
     fn test_shared() -> Arc<SharedLocalPrefetch> {
         Arc::new(SharedLocalPrefetch {
             subscribers: std::sync::atomic::AtomicUsize::new(1),
+            active_parts: std::sync::atomic::AtomicUsize::new(1),
             cancel: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         })
+    }
+
+    #[tokio::test]
+    async fn panic_completes_supervisor_without_marking_live_reader_drained() {
+        let shared = test_shared();
+        shared.active_parts.fetch_add(1, Ordering::AcqRel);
+        let reader = LocalPrefetchCompletion(Arc::clone(&shared));
+        let supervisor = LocalPrefetchCompletion(Arc::clone(&shared));
+        let task = tokio::spawn(async move {
+            let _supervisor = supervisor;
+            panic!("controlled prefetch supervisor failure");
+        });
+        assert!(task.await.is_err());
+        assert!(!shared.finished.load(Ordering::Acquire));
+        drop(reader);
+        assert!(shared.finished.load(Ordering::Acquire));
     }
 
     #[test]
@@ -792,12 +849,15 @@ mod tests {
             max_pack_bytes: 8192,
             deadline: tokio::time::Instant::now() + Duration::from_secs(5),
         };
-        execute_device_prefetch(prepared(), file, test_shared()).await?;
-        assert!(
-            execute_device_prefetch(prepared(), tmp.path().join("missing"), test_shared())
-                .await
-                .is_err()
-        );
+        execute_device_prefetch(prepared(), file, test_shared(), None).await?;
+        assert!(execute_device_prefetch(
+            prepared(),
+            tmp.path().join("missing"),
+            test_shared(),
+            None
+        )
+        .await
+        .is_err());
         Ok(())
     }
 
@@ -966,6 +1026,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_vm_stop_still_cancels_and_can_drain_prefetch() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(async {});
+        let prefetch = LocalStartupPrefetch {
+            cancel: Arc::clone(&cancel),
+            task,
+        };
+        let result = stop_vm_after_prefetch_cancel(Some(&prefetch), async {
+            anyhow::bail!("controlled VM stop error")
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(cancel.load(Ordering::Acquire));
+        prefetch.stop().await;
+    }
+
+    #[tokio::test]
     async fn direct_io_skips_local_prefetch_before_manifest_access() -> Result<()> {
         let tmp = tempfile::TempDir::new()?;
         let global = tmp.path().join("overlaybd.json");
@@ -1019,6 +1096,40 @@ mod tests {
         )
         .await
         .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_descriptor_is_rejected_before_manifest_open() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let global = tmp.path().join("overlaybd.json");
+        tokio::fs::write(
+            &global,
+            serde_json::to_vec(&overlaybd::config::GlobalConfig::default())?,
+        )
+        .await?;
+        let max = overlaybd::startup_manifest::MANIFEST_HEADER_BYTES
+            + overlaybd::startup_manifest::MAX_PREFIX_PAGES as usize * 8
+            + overlaybd::startup_manifest::MAX_RANGES as usize * 16;
+        let pack = crate::snapshot::ResolvedStartupPack {
+            source: crate::snapshot::ResolvedStartupPackSource::LocalPath(
+                tmp.path().join("missing-manifest"),
+            ),
+            pack_size: max as u64 + 1,
+            mem_virtual_size: 4096,
+            index_sha256: "irrelevant".into(),
+        };
+        let outcome = prepare_local_prefetch(
+            tmp.path().join("missing-image-config"),
+            global,
+            pack,
+            &AtomicBool::new(false),
+        )
+        .await;
+        let Err(error) = outcome else {
+            panic!("oversized descriptor must fail before opening the missing file");
+        };
+        assert!(error.to_string().contains("format limit"));
         Ok(())
     }
 
@@ -1125,6 +1236,7 @@ mod tests {
     async fn timeout_cleanup_drains_slow_read_before_marking_finished() {
         let shared = Arc::new(SharedLocalPrefetch {
             subscribers: std::sync::atomic::AtomicUsize::new(1),
+            active_parts: std::sync::atomic::AtomicUsize::new(1),
             cancel: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         });
@@ -1150,7 +1262,12 @@ mod tests {
             worker_shared.cancel.store(true, Ordering::Release);
             read.await.context("blocking reader panicked")?
         };
-        let runner = tokio::spawn(finish_local_prefetch_worker(Arc::clone(&shared), cleanup));
+        let completion = LocalPrefetchCompletion(Arc::clone(&shared));
+        let runner_shared = Arc::clone(&shared);
+        let runner = tokio::spawn(async move {
+            let _completion = completion;
+            finish_local_prefetch_worker(runner_shared, cleanup).await;
+        });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!read_finished.load(Ordering::Acquire));
         assert!(
@@ -1167,6 +1284,7 @@ mod tests {
     async fn last_subscriber_waits_for_worker_to_finish_after_cancellation() {
         let shared = Arc::new(SharedLocalPrefetch {
             subscribers: std::sync::atomic::AtomicUsize::new(1),
+            active_parts: std::sync::atomic::AtomicUsize::new(1),
             cancel: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         });

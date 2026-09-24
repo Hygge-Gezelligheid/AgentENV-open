@@ -647,6 +647,11 @@ impl SandboxExecutor for FirecrackerSandbox {
 // ── FirecrackerSandbox public API ────────────────────────────────────────────
 
 impl FirecrackerSandbox {
+    /// Identity of this sandbox, including for capture provenance.
+    pub fn sandbox_id(&self) -> SandboxId {
+        self.id
+    }
+
     async fn recover_capture_failure<T>(
         &mut self,
         operation: &'static str,
@@ -1403,11 +1408,20 @@ impl FirecrackerSandbox {
         debug!("stopping firecracker sandbox");
 
         let prefetch = self.startup_prefetch_task.take();
-        super::startup_pack::stop_vm_after_prefetch_cancel(
+        let vm_stop = super::startup_pack::stop_vm_after_prefetch_cancel(
             prefetch.as_ref(),
             self.fc_instance.stop(self.runtime_policy.socket_timeout),
         )
-        .await?;
+        .await;
+        if let Err(error) = vm_stop {
+            // If a future Firecracker stop implementation can fail, the VM
+            // may still own its devices. Drain the reader, but retain the
+            // sandbox/device handles for a later stop attempt.
+            if let Some(task) = prefetch {
+                task.stop().await;
+            }
+            return Err(error);
+        }
 
         // Clear envd instance
         if let Some(envd) = self.envd_instance.as_ref() {

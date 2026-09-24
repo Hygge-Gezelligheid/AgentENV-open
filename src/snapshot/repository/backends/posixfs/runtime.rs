@@ -24,6 +24,8 @@ pub struct PosixFsRuntimeResolver {
     repository_root: PathBuf,
     image_materializer: RuntimeImageMaterializer,
     cache: Arc<LocalArtifactCache>,
+    #[cfg(test)]
+    test_consume_enabled: Option<bool>,
 }
 
 struct MaterializeSpec<'a> {
@@ -47,7 +49,15 @@ impl PosixFsRuntimeResolver {
             repository_root,
             image_materializer: RuntimeImageMaterializer::new(runtime_cache_root, store),
             cache,
+            #[cfg(test)]
+            test_consume_enabled: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_consume_enabled(mut self, enabled: bool) -> Self {
+        self.test_consume_enabled = Some(enabled);
+        self
     }
 }
 
@@ -103,14 +113,20 @@ impl SnapshotRuntimeResolver for PosixFsRuntimeResolver {
         let startup_manifest_path = self
             .snapshot_layout(&snapshot_id)
             .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
-        if startup_manifest_path.is_file() {
+        if tokio::fs::metadata(&startup_manifest_path)
+            .await
+            .is_ok_and(|meta| meta.is_file())
+        {
+            let consume_enabled = crate::cfg::ConfigManager::global_config()
+                .snapshot
+                .memory_startup_pack
+                .consume_enabled;
+            #[cfg(test)]
+            let consume_enabled = self.test_consume_enabled.unwrap_or(consume_enabled);
             runtime_manifest.memory_startup_pack =
                 crate::snapshot::startup_pack::resolve_local_startup_pack_ref(
                     committed.memory_startup.as_ref(),
-                    crate::cfg::ConfigManager::global_config()
-                        .snapshot
-                        .memory_startup_pack
-                        .consume_enabled,
+                    consume_enabled,
                     startup_manifest_path,
                 );
         }

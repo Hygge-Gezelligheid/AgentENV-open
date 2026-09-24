@@ -700,6 +700,16 @@ impl PosixFsCatalogStore {
         if committed.memory_startup.is_some() {
             return Ok(());
         }
+        if info.pack_size != bytes.len() as u64
+            || info.index_sha256 != crate::snapshot::startup_pack::hex_sha256(bytes)
+            || overlaybd::startup_manifest::decode_manifest(bytes).map_or(true, |manifest| {
+                manifest.mem_virtual_size != info.mem_virtual_size
+            })
+        {
+            return Err(RepositoryError::InvalidRequest {
+                reason: "startup manifest descriptor does not match artifact".into(),
+            });
+        }
         let path = self
             .layout(id)
             .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
@@ -1335,17 +1345,56 @@ mod tests {
                 CommittedSnapshot::mock(),
             )
             .unwrap();
+        let first_bytes = overlaybd::startup_manifest::encode_manifest(
+            &overlaybd::startup_manifest::StartupManifest {
+                mem_virtual_size: 4096,
+                prefix_pages: Vec::new(),
+                ranges: vec![(0, 4096)],
+            },
+        )
+        .unwrap();
         let first = MemoryStartupPackInfo {
-            pack_size: 11,
+            pack_size: first_bytes.len() as u64,
             mem_virtual_size: 4096,
-            index_sha256: "first".to_owned(),
+            index_sha256: crate::snapshot::startup_pack::hex_sha256(&first_bytes),
         };
-        store
-            .attach_memory_startup(&id, first.clone(), b"manifest-v1")
-            .unwrap();
+        assert!(store
+            .attach_memory_startup(
+                &id,
+                MemoryStartupPackInfo {
+                    pack_size: first.pack_size + 1,
+                    ..first.clone()
+                },
+                &first_bytes,
+            )
+            .is_err());
+        assert!(store
+            .attach_memory_startup(
+                &id,
+                MemoryStartupPackInfo {
+                    index_sha256: "wrong hash".into(),
+                    ..first.clone()
+                },
+                &first_bytes,
+            )
+            .is_err());
+        assert!(store
+            .attach_memory_startup(
+                &id,
+                MemoryStartupPackInfo {
+                    mem_virtual_size: 8192,
+                    ..first.clone()
+                },
+                &first_bytes,
+            )
+            .is_err());
         let artifact = PosixFsSnapshotArtifactLayout::new(&root, &id)
             .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
-        assert_eq!(std::fs::read(&artifact).unwrap(), b"manifest-v1");
+        std::fs::write(&artifact, b"orphan from interrupted attach").unwrap();
+        store
+            .attach_memory_startup(&id, first.clone(), &first_bytes)
+            .unwrap();
+        assert_eq!(std::fs::read(&artifact).unwrap(), first_bytes);
         store
             .attach_memory_startup(
                 &id,
@@ -1357,7 +1406,7 @@ mod tests {
                 b"manifest-v2",
             )
             .unwrap();
-        assert_eq!(std::fs::read(&artifact).unwrap(), b"manifest-v1");
+        assert_eq!(std::fs::read(&artifact).unwrap(), first_bytes);
         assert_eq!(
             store
                 .get(&id.to_string())
@@ -1366,7 +1415,7 @@ mod tests {
                 .committed
                 .unwrap()
                 .memory_startup,
-            Some(first)
+            Some(first.clone())
         );
 
         let race_id = SnapshotId::generate();
@@ -1383,21 +1432,15 @@ mod tests {
             )
             .unwrap();
         let attach_root = root.clone();
+        let race_bytes = first_bytes.clone();
+        let race_info = first.clone();
         let delete_root = root.clone();
         let attach_id = race_id.clone();
         let delete_id = race_id.clone();
         std::thread::scope(|scope| {
             scope.spawn(move || {
                 PosixFsCatalogStore::new(attach_root)
-                    .attach_memory_startup(
-                        &attach_id,
-                        MemoryStartupPackInfo {
-                            pack_size: 4,
-                            mem_virtual_size: 4096,
-                            index_sha256: "race".to_owned(),
-                        },
-                        b"race",
-                    )
+                    .attach_memory_startup(&attach_id, race_info, &race_bytes)
                     .unwrap();
             });
             scope.spawn(move || {

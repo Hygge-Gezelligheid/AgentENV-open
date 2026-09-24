@@ -456,7 +456,7 @@ resume through the ordinary on-demand path.
 | `record_budget_secs` | integer | `10` | Best-effort recording budget; it never blocks the snapshot publish. |
 | `max_pack_bytes` | integer | `1073741824` | Maximum recorded page-data budget and POSIX logical prefetch budget. |
 | `consume_enabled` | boolean | `false` | Enable resume-time prefetch; leave disabled for rollout and A/B comparisons. |
-| `consume_timeout_secs` | integer | `30` | Bound a prefetch run, including its shared read queue. |
+| `consume_timeout_secs` | integer | `30` | Deadline for queueing and dispatching further prefetch reads; an in-kernel read may outlive it. |
 
 For POSIX, the resolver hands the normal sandbox start path a `LocalPath`
 manifest. After acquiring the actual shared memory ublk device, the executor
