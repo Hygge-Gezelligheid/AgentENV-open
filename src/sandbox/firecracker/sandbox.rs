@@ -1,14 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
 use nix::libc;
 use tempfile::TempDir;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 use uuid::Uuid;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
@@ -52,22 +51,6 @@ use crate::snapshot::RunnableSnapshot;
 use crate::types::SandboxId;
 
 // ── Constants ────────────────────────────────────────────────────────────────
-
-const STARTUP_TIMING_ENV: &str = "AENV_POSIX_STARTUP_PACK_TIMING";
-
-fn startup_timing_start() -> Option<Instant> {
-    std::env::var_os(STARTUP_TIMING_ENV).map(|_| Instant::now())
-}
-
-fn log_startup_timing(start: Option<Instant>, phase: &'static str) {
-    if let Some(start) = start {
-        info!(
-            phase,
-            elapsed_ms = start.elapsed().as_millis() as u64,
-            "startup timing"
-        );
-    }
-}
 
 const VM_STATE_FILE_NAME: &str = "vm_state.bin";
 const ROOTFS_DRIVE_PATH: &str = "rootfs.ext4";
@@ -857,12 +840,9 @@ impl FirecrackerSandbox {
     /// This waits for the Firecracker API socket and the in-guest envd daemon.
     #[tracing::instrument(skip(self))]
     pub async fn start(&mut self) -> Result<()> {
-        let timing = startup_timing_start();
         debug!("starting firecracker sandbox");
         self.start_nowait().await?;
-        log_startup_timing(timing, "start_nowait_complete");
         self.wait_for_ready().await?;
-        log_startup_timing(timing, "envd_ready_complete");
         Ok(())
     }
 
@@ -871,16 +851,13 @@ impl FirecrackerSandbox {
     /// This only waits for the Firecracker API socket to be available and
     /// returns immediately after VM start command is issued.
     pub(crate) async fn start_nowait(&mut self) -> Result<()> {
-        let timing = startup_timing_start();
         self.prepare_tools_drive().await?;
-        log_startup_timing(timing, "tools_drive_ready");
         self.launch.validate()?;
         trace!("launch config validated");
         match &self.launch {
             LaunchMode::Fresh(config) => self.start_fresh(config.clone()).await?,
             LaunchMode::Resume(config) => self.start_resume(config.clone()).await?,
         }
-        log_startup_timing(timing, "start_nowait_return");
         Ok(())
     }
 
@@ -910,7 +887,6 @@ impl FirecrackerSandbox {
     /// This should be called after `start_nowait()` if you want to interact with the sandbox.
     #[tracing::instrument(skip(self))]
     pub(crate) async fn wait_for_ready(&self) -> Result<()> {
-        let timing = startup_timing_start();
         let Some(envd_instance) = self.envd_instance.as_ref() else {
             return Err(anyhow::anyhow!("envd instance not initialized"));
         };
@@ -920,7 +896,6 @@ impl FirecrackerSandbox {
                 self.runtime_policy.envd_poll_interval,
             )
             .await?;
-        log_startup_timing(timing, "envd_health_ready");
         if let Some(tools) = &self.tools_ublk_device {
             let _ = UblkDeviceManager::global()
                 .notify_sandbox_ready(tools.image_config_path())
@@ -940,7 +915,6 @@ impl FirecrackerSandbox {
                 .notify_sandbox_ready(device_key)
                 .await;
         }
-        log_startup_timing(timing, "post_health_notifications_complete");
         envd_instance
             .init(
                 self.launch.common().env_vars.clone(),
@@ -948,7 +922,6 @@ impl FirecrackerSandbox {
                 self.launch.common().default_user.clone(),
             )
             .await?;
-        log_startup_timing(timing, "envd_init_complete");
 
         // The snapshot already carries mount state for its existing drives.
         // Only drives newly supplied for this launch need a guest-side mount.
@@ -959,7 +932,6 @@ impl FirecrackerSandbox {
                 .context("Sandbox is not running")?;
             Self::mount_initial_guest_drives(envd, self.initial_guest_drive_mounts.clone()).await?;
         }
-        log_startup_timing(timing, "wait_for_ready_complete");
 
         Ok(())
     }
@@ -1408,11 +1380,13 @@ impl FirecrackerSandbox {
         debug!("stopping firecracker sandbox");
 
         let prefetch = self.startup_prefetch_task.take();
-        let vm_stop = super::startup_pack::stop_vm_after_prefetch_cancel(
-            prefetch.as_ref(),
-            self.fc_instance.stop(self.runtime_policy.socket_timeout),
-        )
-        .await;
+        if let Some(task) = prefetch.as_ref() {
+            task.cancel();
+        }
+        let vm_stop = self
+            .fc_instance
+            .stop(self.runtime_policy.socket_timeout)
+            .await;
         if let Err(error) = vm_stop {
             // If a future Firecracker stop implementation can fail, the VM
             // may still own its devices. Drain the reader, but retain the
@@ -1964,7 +1938,6 @@ impl FirecrackerSandbox {
 
     #[tracing::instrument(skip(self, config))]
     async fn start_resume(&mut self, config: FirecrackerSnapshotConfig) -> Result<()> {
-        let timing = startup_timing_start();
         // NOTE: The virtio-balloon device is NOT configured here. Balloon state
         // is part of vm_state.bin and is restored automatically by Firecracker.
         // Snapshots taken before balloon support was added will simply not have
@@ -2075,7 +2048,6 @@ impl FirecrackerSandbox {
             self.current_rootfs_virtual_size = Some(runtime_device.actual_virtual_size);
         }
 
-        log_startup_timing(timing, "resume_rootfs_ready");
         // ── Extra drives ──
         let extra_drive_attachments = self
             .prepare_snapshot_backing_drives(&config.common.extra_drives)
@@ -2113,7 +2085,6 @@ impl FirecrackerSandbox {
             }
         }
 
-        log_startup_timing(timing, "resume_extra_drives_ready");
         // ── Network + Firecracker spawn ──
         let needs_socket_wait = self.network_slot.is_none();
         let interaction_ip = if let Some(slot) = self.network_slot.as_ref() {
@@ -2146,7 +2117,6 @@ impl FirecrackerSandbox {
                 .context("Failed to configure sandbox egress policy for resume")?;
         }
 
-        log_startup_timing(timing, "resume_firecracker_spawned");
         // ── Custom extension hook: start-resume ──
         // Pack-recording VMs are throwaway recorders: hooks must not fire
         // for them (the extension would see a phantom sandbox start/stop).
@@ -2181,7 +2151,6 @@ impl FirecrackerSandbox {
             .memory_snapshot
             .overlaybd_global_config_path
             .clone();
-        log_startup_timing(timing, "resume_extension_and_envd_configured");
         let mem_device_path = if config.pack_recording {
             // Pack-recording VMs get a dedicated, non-shared memory device:
             // sharing one (or the block-device page cache behind it) would
@@ -2266,7 +2235,6 @@ impl FirecrackerSandbox {
                     self.startup_prefetch_task =
                         Some(super::startup_pack::submit_local_startup_prefetch(
                             mem_device.clone(),
-                            config.mem_overlaybd_config.image_config_path.clone(),
                             mem_global_config.clone(),
                             pack.clone(),
                         ));
@@ -2279,7 +2247,6 @@ impl FirecrackerSandbox {
             device_path
         };
 
-        log_startup_timing(timing, "resume_prefetch_submitted_and_memory_device_ready");
         if needs_socket_wait {
             self.fc_instance
                 .wait_for_ready(
@@ -2289,12 +2256,10 @@ impl FirecrackerSandbox {
                 .await?;
         }
 
-        log_startup_timing(timing, "resume_api_socket_ready");
         self.configure_logger(&config.common).await?;
 
         // Override the network interface to use the new tap0 in our namespace
         let network_overrides = [("eth0", "tap0")];
-        log_startup_timing(timing, "resume_snapshot_load_begin");
         self.fc_instance
             .load_snapshot_file(
                 &vm_state_src,
@@ -2327,7 +2292,6 @@ impl FirecrackerSandbox {
                     })?;
             }
         }
-        log_startup_timing(timing, "resume_snapshot_loaded");
         let mmds_metadata = self.mmds_metadata(&config.common);
         self.fc_instance.set_mmds(&mmds_metadata).await?;
 
@@ -2344,7 +2308,6 @@ impl FirecrackerSandbox {
             .context("reconcile disk rate limiter on snapshot resume")?;
 
         self.fc_instance.resume().await?;
-        log_startup_timing(timing, "resume_command_issued");
 
         debug!("sandbox restored from snapshot config");
         Ok(())
