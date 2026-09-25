@@ -110,25 +110,27 @@ impl SnapshotRuntimeResolver for PosixFsRuntimeResolver {
             rootfs_image_config_path,
             &attached_drives,
         )?;
-        let startup_manifest_path = self
-            .snapshot_layout(&snapshot_id)
-            .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
-        if tokio::fs::metadata(&startup_manifest_path)
-            .await
-            .is_ok_and(|meta| meta.is_file())
-        {
-            let consume_enabled = crate::cfg::ConfigManager::global_config()
-                .snapshot
-                .memory_startup_pack
-                .consume_enabled;
-            #[cfg(test)]
-            let consume_enabled = self.test_consume_enabled.unwrap_or(consume_enabled);
-            runtime_manifest.memory_startup_pack =
-                crate::snapshot::startup_pack::resolve_local_startup_pack_ref(
-                    committed.memory_startup.as_ref(),
-                    consume_enabled,
-                    startup_manifest_path,
-                );
+        let consume_enabled = crate::cfg::ConfigManager::global_config()
+            .snapshot
+            .memory_startup_pack
+            .consume_enabled;
+        #[cfg(test)]
+        let consume_enabled = self.test_consume_enabled.unwrap_or(consume_enabled);
+        if consume_enabled && committed.memory_startup.is_some() {
+            let startup_manifest_path = self
+                .snapshot_layout(&snapshot_id)
+                .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
+            if tokio::fs::metadata(&startup_manifest_path)
+                .await
+                .is_ok_and(|meta| meta.is_file())
+            {
+                runtime_manifest.memory_startup_pack =
+                    crate::snapshot::startup_pack::resolve_local_startup_pack_ref(
+                        committed.memory_startup.as_ref(),
+                        consume_enabled,
+                        startup_manifest_path,
+                    );
+            }
         }
         // Runtime artifacts are protected by the sandbox start-window lease (over
         // local-only commits) + the orchestrator running set; the resolved-handle

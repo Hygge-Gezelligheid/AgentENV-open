@@ -25,6 +25,25 @@ pub struct StartupRecording {
     pub keep_alive: Box<dyn std::any::Any + Send>,
 }
 
+impl StartupRecording {
+    /// Give both the recorder and its later publisher a capture-root lease.
+    /// Dropping the publication future detaches the recorder, not its lease.
+    pub(crate) fn spawn_with_capture_lease<F, T>(recorder: F, lease: std::sync::Arc<T>) -> Self
+    where
+        F: std::future::Future<Output = Option<PathBuf>> + Send + 'static,
+        T: std::any::Any + Send + Sync + 'static,
+    {
+        let task_lease = std::sync::Arc::clone(&lease);
+        Self {
+            trace: tokio::spawn(async move {
+                let _task_lease = task_lease;
+                recorder.await
+            }),
+            keep_alive: Box::new(lease),
+        }
+    }
+}
+
 // ── Shutdown coordination for detached manifest work ────────────────────────
 
 use std::sync::{Arc, Mutex, OnceLock};
@@ -32,8 +51,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// Process-global coordination for detached startup-manifest work. Graceful
 /// shutdown first stops NEW continuations from spawning, then drains the
 /// in-flight ones (bounded): their recordings complete and manifests land
-/// instead of being canceled outright. Only a drain timeout force-cancels
-/// what is left.
+/// when possible. A drain timeout sends an abort notification; tasks still
+/// own their leases until their own recorder and continuation cleanup ends.
 struct StartupManifestShutdown {
     state: Mutex<StartupManifestShutdownState>,
     abort: tokio::sync::watch::Sender<bool>,
@@ -122,7 +141,8 @@ pub async fn startup_manifest_abort_notify() {
 
 /// Request shutdown: stop spawning new startup-manifest continuations, then
 /// wait (bounded by `timeout`) for the in-flight ones to drain so their
-/// manifests still land. Whatever survives the timeout is force-canceled.
+/// manifests still land. A timeout requests cancellation but does not
+/// synchronously revoke resources still owned by those tasks.
 pub async fn drain_startup_manifest_tasks(timeout: std::time::Duration) {
     startup_manifest_shutdown().drain(timeout).await;
 }

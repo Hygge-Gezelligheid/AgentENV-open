@@ -738,6 +738,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_publish_keeps_capture_lease_until_pending_recorder_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct LeaseProbe(Arc<AtomicBool>);
+        impl Drop for LeaseProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let tempdir = TempDir::new().unwrap();
+        let repository = test_repository(tempdir.path());
+        let mut manifest = seed_built_snapshot(tempdir.path());
+        manifest.vm_state.path = tempdir.path().join("missing-vm-state");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let recording = crate::snapshot::StartupRecording::spawn_with_capture_lease(
+            async move {
+                let _ = wait.await;
+                None
+            },
+            Arc::new(LeaseProbe(Arc::clone(&dropped))),
+        );
+        assert!(repository
+            .publish(
+                sample_metadata(SnapshotId::generate(), None),
+                manifest,
+                Some(recording)
+            )
+            .await
+            .is_err());
+        assert!(!dropped.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recorder release");
+    }
+
+    #[tokio::test]
+    async fn cancelled_publish_keeps_capture_lease_until_pending_recorder_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct LeaseProbe(Arc<AtomicBool>);
+        impl Drop for LeaseProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let tempdir = TempDir::new().unwrap();
+        let repository = test_repository(tempdir.path());
+        let manifest = seed_built_snapshot(tempdir.path());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let recording = crate::snapshot::StartupRecording::spawn_with_capture_lease(
+            async move {
+                let _ = wait.await;
+                None
+            },
+            Arc::new(LeaseProbe(Arc::clone(&dropped))),
+        );
+        let publish = repository.publish(
+            sample_metadata(SnapshotId::generate(), None),
+            manifest,
+            Some(recording),
+        );
+        // Cancel before the first poll; the recorder is already detached.
+        drop(publish);
+        assert!(!dropped.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recorder release");
+    }
+
+    #[tokio::test]
     async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
         let tempdir = TempDir::new().expect("tempdir");
         let backend = test_backend(tempdir.path());
@@ -810,6 +890,34 @@ mod tests {
             std::fs::read(path).unwrap().len() as u64,
             descriptor.pack_size
         );
+        let disabled = PosixFsRuntimeResolver::new(
+            tempdir.path().to_path_buf(),
+            tempdir.path().join("runtime-disabled"),
+            test_overlaybd_layer_store(),
+            LocalArtifactCache::new(tempdir.path().join("cache-disabled"), None).unwrap(),
+        )
+        .with_test_consume_enabled(false);
+        let record = repository
+            .get(&snapshot_id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(disabled
+            .resolve(Arc::new(record.clone()))
+            .await
+            .unwrap()
+            .manifest()
+            .memory_startup_pack
+            .is_none());
+        let mut legacy = record;
+        legacy.committed.as_mut().unwrap().memory_startup = None;
+        assert!(resolver
+            .resolve(Arc::new(legacy))
+            .await
+            .unwrap()
+            .manifest()
+            .memory_startup_pack
+            .is_none());
     }
 
     #[tokio::test]

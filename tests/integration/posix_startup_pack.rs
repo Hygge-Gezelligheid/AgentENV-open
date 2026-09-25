@@ -25,10 +25,20 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
 
     let root = tempfile::tempdir()?;
     let (_, manager, _) = common::snapshot_test_parts(root.path());
-    let mut original = FirecrackerSandbox::new(common::default_sandbox_config()?)?;
+    let sandbox_config = common::default_sandbox_config()?;
+    let cpu_count = sandbox_config.vcpu_count;
+    let memory_mib = sandbox_config.mem_size_mib;
+    let vmm_binary = sandbox_config.common.firecracker_binary.clone();
+    let tools_drive_version = sandbox_config.common.tools_drive_version.clone();
+    let mut original = FirecrackerSandbox::new(sandbox_config)?;
     let source_id = original.sandbox_id();
     let result = async {
         original.start().await?;
+        let runtime_versions =
+            SnapshotRuntimeVersions::probe(&original, vmm_binary, tools_drive_version).await?;
+        let rootfs_bytes = SandboxBackend::runtime_info(&original)
+            .rootfs_virtual_size
+            .context("source sandbox has no rootfs virtual size")?;
         let captured = SandboxBackend::snapshot(&mut original).await?;
         let record = manager
             .publish_captured(
@@ -44,16 +54,11 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
                     context: agentenv::snapshot::CommandContext::default(),
                     startup: None,
                     resources: SandboxResources {
-                        cpu_count: 1,
-                        memory_mib: 128,
-                        disk_size_mib: 0,
+                        cpu_count,
+                        memory_mib,
+                        disk_size_mib: rootfs_bytes.div_ceil(1 << 20).try_into()?,
                     },
-                    runtime_versions: SnapshotRuntimeVersions {
-                        kernel_version: "kernel".into(),
-                        firecracker_version: "firecracker".into(),
-                        envd_version: "envd".into(),
-                        tools_drive_version: config.resolved_tools_version().to_string(),
-                    },
+                    runtime_versions,
                     virtualization_mode: config.virtualization_mode,
                     image_configs: agentenv::types::ImageConfigs::new(),
                     volume_snapshots: Vec::new(),
@@ -92,10 +97,18 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
         let ResolvedStartupPackSource::LocalPath(path) = &pack.source else {
             bail!("POSIX resolver selected a non-local startup-pack source");
         };
-        assert!(
+        anyhow::ensure!(
             path.is_file(),
             "LocalPath manifest must exist: {}",
             path.display()
+        );
+        // The formal hardware smoke in scripts/verify-posix-startup-pack-smoke.py
+        // also verifies a positive read from this restore's memory device.
+        let manifest_bytes = std::fs::read(path)?;
+        let manifest = overlaybd::startup_manifest::decode_manifest(&manifest_bytes)?;
+        anyhow::ensure!(
+            !manifest.prefix_pages.is_empty() || !manifest.ranges.is_empty(),
+            "recorded startup manifest is empty"
         );
 
         let launch = SandboxLaunchConfig {
@@ -113,7 +126,8 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
         let resumed = restored.start().await;
         let stopped = restored.stop().await;
         resumed?;
-        stopped
+        stopped?;
+        Ok(())
     }
     .await;
     let stopped = original.stop().await;

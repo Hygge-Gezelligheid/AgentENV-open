@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -683,7 +683,10 @@ impl PosixFsCatalogStore {
         }
         Ok(())
     }
-    /// Atomically persist a verified manifest and attach it only while the committed record exists.
+    /// Persist a verified manifest before attaching its descriptor under the record lock.
+    /// A crash between the two renames may leave an orphan artifact or a descriptor
+    /// with a missing artifact; retry with the same descriptor repairs either state.
+    /// This is not a multi-file durable transaction.
     pub(crate) fn attach_memory_startup(
         &self,
         id: &SnapshotId,
@@ -697,9 +700,6 @@ impl PosixFsCatalogStore {
         let Some(committed) = record.committed.as_mut() else {
             return Ok(());
         };
-        if committed.memory_startup.is_some() {
-            return Ok(());
-        }
         if info.pack_size != bytes.len() as u64
             || info.index_sha256 != crate::snapshot::startup_pack::hex_sha256(bytes)
             || overlaybd::startup_manifest::decode_manifest(bytes).map_or(true, |manifest| {
@@ -713,6 +713,25 @@ impl PosixFsCatalogStore {
         let path = self
             .layout(id)
             .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
+        if let Some(existing) = committed.memory_startup.as_ref() {
+            if existing != &info {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: "startup manifest descriptor already differs".into(),
+                });
+            }
+            let artifact_matches = fs::File::open(&path).is_ok_and(|file| {
+                let mut artifact = Vec::new();
+                file.take(bytes.len() as u64 + 1)
+                    .read_to_end(&mut artifact)
+                    .is_ok_and(|_| artifact == bytes)
+            });
+            if artifact_matches {
+                return Ok(());
+            }
+            // A matching descriptor with a missing or corrupt artifact can be
+            // repaired only by supplying bytes verified against that descriptor.
+        }
+        let already_attached = committed.memory_startup.is_some();
         let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
             message: format!("resolve parent for {}", path.display()),
             source: None,
@@ -734,11 +753,12 @@ impl PosixFsCatalogStore {
         temp.persist(&path).map_err(|error| {
             RepositoryError::backend(format!("persist manifest {}", path.display()), error.error)
         })?;
-        committed.memory_startup = Some(info);
-        record.updated_at_unix_ms = now_unix_ms();
-        if let Err(error) = self.write_record_unlocked(&record) {
-            let _ = fs::remove_file(&path);
-            return Err(error);
+        if !already_attached {
+            committed.memory_startup = Some(info);
+            record.updated_at_unix_ms = now_unix_ms();
+            // Keep a verified orphan artifact on record-write failure: a retry
+            // can reuse it, while readers see no descriptor until commit.
+            self.write_record_unlocked(&record)?;
         }
         Ok(())
     }
@@ -1395,17 +1415,35 @@ mod tests {
             .attach_memory_startup(&id, first.clone(), &first_bytes)
             .unwrap();
         assert_eq!(std::fs::read(&artifact).unwrap(), first_bytes);
+        std::fs::remove_file(&artifact).unwrap();
         store
+            .attach_memory_startup(&id, first.clone(), &first_bytes)
+            .unwrap();
+        assert_eq!(std::fs::read(&artifact).unwrap(), first_bytes);
+        std::fs::write(&artifact, b"corrupt after descriptor attach").unwrap();
+        store
+            .attach_memory_startup(&id, first.clone(), &first_bytes)
+            .unwrap();
+        assert_eq!(std::fs::read(&artifact).unwrap(), first_bytes);
+        let second_bytes = overlaybd::startup_manifest::encode_manifest(
+            &overlaybd::startup_manifest::StartupManifest {
+                mem_virtual_size: 8192,
+                prefix_pages: Vec::new(),
+                ranges: vec![(4096, 4096)],
+            },
+        )
+        .unwrap();
+        assert!(store
             .attach_memory_startup(
                 &id,
                 MemoryStartupPackInfo {
-                    pack_size: 12,
+                    pack_size: second_bytes.len() as u64,
                     mem_virtual_size: 8192,
-                    index_sha256: "second".to_owned(),
+                    index_sha256: crate::snapshot::startup_pack::hex_sha256(&second_bytes),
                 },
-                b"manifest-v2",
+                &second_bytes,
             )
-            .unwrap();
+            .is_err());
         assert_eq!(std::fs::read(&artifact).unwrap(), first_bytes);
         assert_eq!(
             store
