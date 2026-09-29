@@ -4,29 +4,26 @@
 //! boot one throwaway VM from the captured snapshot with a dedicated memory
 //! device so the daemon-side recorder sees every first-touch read while all
 //! memory layers are still node-local. The recorder emits a first-touch trace
-//! file; the publisher expands it into the v3 startup manifest (exact-order
+//! file; the publisher expands it into the v4 startup manifest (exact-order
 //! prefix plus merged ranges) and uploads just that list. The whole flow is
 //! best-effort: any failure returns `None` and the publish continues without
 //! a manifest.
 
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 use uvm_ublk_daemon::protocol::PackRecordingState;
 
 use super::{FirecrackerSandbox, FirecrackerSnapshotConfig};
-use crate::cfg::{ConfigManager, SnapshotRepositoryBackendKind};
+use crate::cfg::ConfigManager;
 use crate::sandbox::ublk::UblkDeviceManager;
 use crate::snapshot::MEMORY_STARTUP_TRACE_ARTIFACT;
 
-/// Recording happens only for the OSS repository backend with the feature
-/// enabled: POSIX-backed snapshots resolve memory layers to plain repository
-/// file paths, so there is no small-request object-storage chain to absorb.
+/// Recording is opt-in for every repository backend. The publisher selects
+/// the durable manifest destination appropriate to its backend.
 fn recording_enabled_for(config: &crate::cfg::SnapshotConfig) -> bool {
     config.memory_startup_pack.enabled
-        && config.repository_backend == SnapshotRepositoryBackendKind::Oss
 }
 
 fn recording_enabled() -> bool {
@@ -191,6 +188,7 @@ async fn boot_and_wait(
     match outcome {
         WaitOutcome::Done(Some((pages, bytes))) => {
             debug!(pages, bytes, "startup pack recording finished");
+
             Some(trace_path.to_path_buf())
         }
         WaitOutcome::Done(None) => None,
@@ -244,6 +242,7 @@ async fn derive_recording_mem_config(src: &Path, snapshot_dir: &Path) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfg::SnapshotRepositoryBackendKind;
 
     #[tokio::test]
     async fn recording_mem_config_disables_background_download() -> Result<()> {
@@ -274,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn recording_gate_requires_oss_backend_and_enabled() {
+    fn recording_gate_uses_feature_enablement_for_all_backends() {
         fn startup_pack_config(enabled: bool) -> crate::cfg::SnapshotStartupPackConfig {
             crate::cfg::SnapshotStartupPackConfig {
                 enabled,
@@ -300,8 +299,8 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !recording_enabled_for(&posix_enabled),
-            "enabled=true with posix_fs backend must NOT record"
+            recording_enabled_for(&posix_enabled),
+            "enabled=true with posix_fs backend must record"
         );
 
         let oss_enabled = crate::cfg::SnapshotConfig {

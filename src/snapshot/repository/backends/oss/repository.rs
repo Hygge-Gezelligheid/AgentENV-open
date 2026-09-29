@@ -459,14 +459,20 @@ impl SnapshotRepository for OssSnapshotRepository {
             .snapshot
             .memory_startup_pack
             .enabled
-            && !crate::snapshot::startup_pack::startup_manifest_shutdown_requested()
         {
             if let Some(recording) = recording {
-                tokio::spawn(finish_startup_manifest(
-                    self.client.clone(),
-                    metadata.id.clone(),
-                    recording,
-                ));
+                if let Some(guard) =
+                    crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()
+                {
+                    tokio::spawn(finish_startup_manifest(
+                        self.client.clone(),
+                        metadata.id.clone(),
+                        recording,
+                        guard,
+                    ));
+                } else {
+                    recording.detach();
+                }
             }
         }
 
@@ -1952,18 +1958,43 @@ async fn finish_startup_manifest(
     client: std::sync::Arc<OssClient>,
     id: SnapshotId,
     recording: crate::snapshot::StartupRecording,
+    guard: crate::snapshot::startup_pack::StartupManifestTaskGuard,
 ) {
-    let crate::snapshot::StartupRecording { trace, keep_alive } = recording;
+    finish_startup_manifest_with_abort(
+        client,
+        id,
+        recording,
+        guard,
+        crate::snapshot::startup_pack::startup_manifest_abort_requested,
+    )
+    .await;
+}
+
+async fn finish_startup_manifest_with_abort(
+    client: std::sync::Arc<OssClient>,
+    id: SnapshotId,
+    recording: crate::snapshot::StartupRecording,
+    _guard: crate::snapshot::startup_pack::StartupManifestTaskGuard,
+    abort_requested: impl Fn() -> bool + Send,
+) {
+    let crate::snapshot::StartupRecording {
+        mut trace,
+        keep_alive,
+    } = recording;
     // Hold the captured artifacts alive until the manifest is uploaded, and
     // count this continuation for the shutdown drain.
     let _keep_alive = keep_alive;
-    let _guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::new();
-    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+    if abort_requested() {
+        // The recorder may still be using captured VM/device artifacts.
+        let _ = trace.await;
         return;
     }
     let trace_path = match tokio::select! {
-        joined = trace => joined,
-        _ = crate::snapshot::startup_pack::startup_manifest_abort_notify() => return,
+        joined = &mut trace => joined,
+        _ = crate::snapshot::startup_pack::startup_manifest_abort_notify() => {
+            let _ = trace.await;
+            return;
+        },
     } {
         Ok(Some(path)) => path,
         Ok(None) => {
@@ -1975,20 +2006,20 @@ async fn finish_startup_manifest(
             return;
         }
     };
-    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+    if abort_requested() {
         return;
     }
     let layout = OssSnapshotArtifactLayout::new(&id);
     let Some(info) = build_and_upload_manifest(&client, &layout, &id, &trace_path).await else {
         return;
     };
-    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+    if abort_requested() {
         return;
     }
     attach_memory_startup_descriptor(&client, &id, info).await;
 }
 
-/// Best-effort: build the v3 startup manifest (exact-order prefix pages
+/// Best-effort: build the v4 startup manifest (exact-order prefix pages
 /// plus merged ranges) from the recorded first-touch trace and upload it.
 /// No layer bytes are read, packed, or uploaded — the resume side prefetches
 /// the listed positions through the normal read path.
@@ -2002,67 +2033,15 @@ async fn build_and_upload_manifest(
         .snapshot
         .memory_startup_pack;
     let build = async {
-        let trace = match tokio::fs::read(trace_path).await {
-            Ok(trace) => trace,
-            Err(error) => {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    debug!(
-                        %error,
-                        snapshot_id = %id,
-                        "read startup trace failed; publishing without a manifest"
-                    );
-                }
-                return None;
-            }
-        };
-        let (mem_virtual_size, offsets) = match overlaybd::startup_pack::decode_trace(&trace) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                warn!(
-                    %error,
-                    snapshot_id = %id,
-                    "startup trace undecodable; publishing without a manifest"
-                );
-                return None;
-            }
-        };
-        let manifest_doc =
-            match overlaybd::startup_manifest::build_manifest(mem_virtual_size, &offsets) {
-                Ok(doc) => doc,
+        let (info, manifest_bytes) =
+            match crate::snapshot::startup_pack::build_startup_manifest(trace_path).await {
+                Ok(built) => built,
                 Err(error) => {
-                    warn!(
-                        %error,
-                        snapshot_id = %id,
-                        "build startup manifest failed (best-effort)"
-                    );
+                    warn!(%error, snapshot_id = %id, "startup manifest build failed (best-effort)");
                     return None;
                 }
             };
-        let manifest_bytes = match overlaybd::startup_manifest::encode_manifest(&manifest_doc) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                warn!(
-                    %error,
-                    snapshot_id = %id,
-                    "encode startup manifest failed (best-effort)"
-                );
-                return None;
-            }
-        };
-        info!(
-            snapshot_id = %id,
-            pages = offsets.len(),
-            prefix_pages = manifest_doc.prefix_pages.len(),
-            ranges = manifest_doc.ranges.len(),
-            manifest_bytes = manifest_bytes.len(),
-            "startup manifest built"
-        );
-
-        let info = MemoryStartupPackInfo {
-            pack_size: manifest_bytes.len() as u64,
-            mem_virtual_size,
-            index_sha256: crate::snapshot::startup_pack::hex_sha256(&manifest_bytes),
-        };
+        info!(snapshot_id = %id, manifest_bytes = manifest_bytes.len(), "startup manifest built");
         if let Err(error) = client
             .put_bytes(
                 &layout.artifact_key(MEMORY_STARTUP_PACK_ARTIFACT),
@@ -2213,6 +2192,55 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[tokio::test]
+    async fn abort_before_oss_continuation_keeps_capture_lease_until_trace_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct LeaseProbe(Arc<AtomicBool>);
+        impl Drop for LeaseProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let lease_dropped = Arc::new(AtomicBool::new(false));
+        let trace_finished = Arc::new(AtomicBool::new(false));
+        let (release_trace, trace_release) = tokio::sync::oneshot::channel::<()>();
+        let trace_finished_in_task = Arc::clone(&trace_finished);
+        let recording = crate::snapshot::StartupRecording {
+            trace: tokio::spawn(async move {
+                trace_release.await.expect("release trace");
+                trace_finished_in_task.store(true, Ordering::SeqCst);
+                None
+            }),
+            keep_alive: Box::new(LeaseProbe(Arc::clone(&lease_dropped))),
+        };
+        let guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()
+            .expect("register continuation");
+        let repository = test_repository();
+        let mut continuation = tokio::spawn(finish_startup_manifest_with_abort(
+            Arc::clone(&repository.client),
+            SnapshotId::generate(),
+            recording,
+            guard,
+            || true,
+        ));
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut continuation)
+                .await
+                .is_err(),
+            "aborted continuation must wait for the pending recorder"
+        );
+        assert!(!trace_finished.load(Ordering::SeqCst));
+        assert!(!lease_dropped.load(Ordering::SeqCst));
+
+        release_trace.send(()).expect("release pending trace");
+        continuation.await.expect("continuation");
+        assert!(trace_finished.load(Ordering::SeqCst));
+        assert!(lease_dropped.load(Ordering::SeqCst));
     }
 
     #[test]

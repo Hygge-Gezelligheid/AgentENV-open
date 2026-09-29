@@ -1,6 +1,7 @@
 //! Startup memory pack artifact constants and the committed-record
 //! descriptor. The wire format itself lives in the overlaybd crate (shared
 //! with the ublk daemon); this module re-exports what agentenv needs.
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub const MEMORY_STARTUP_PACK_ARTIFACT: &str = "memory-startup.pack";
 
 /// File name of the local first-touch trace the recorder emits next to the
-/// snapshot artifacts. The publisher expands it into the v3 startup manifest
+/// snapshot artifacts. The publisher expands it into the v4 startup manifest
 /// (exact-order prefix plus merged ranges); it never leaves the node as-is.
 pub const MEMORY_STARTUP_TRACE_ARTIFACT: &str = "memory-startup.trace";
 
@@ -24,114 +25,174 @@ pub struct StartupRecording {
     pub keep_alive: Box<dyn std::any::Any + Send>,
 }
 
+impl StartupRecording {
+    /// Keep recorder cleanup and its capture lease alive without delaying publication.
+    pub(crate) fn detach(self) {
+        tokio::spawn(async move {
+            let _ = self.trace.await;
+            drop(self.keep_alive);
+        });
+    }
+
+    /// Give both the recorder and its later publisher a capture-root lease.
+    /// Dropping the publication future detaches the recorder, not its lease.
+    pub(crate) fn spawn_with_capture_lease<F, T>(recorder: F, lease: std::sync::Arc<T>) -> Self
+    where
+        F: std::future::Future<Output = Option<PathBuf>> + Send + 'static,
+        T: std::any::Any + Send + Sync + 'static,
+    {
+        let task_lease = std::sync::Arc::clone(&lease);
+        Self {
+            trace: tokio::spawn(async move {
+                let _task_lease = task_lease;
+                recorder.await
+            }),
+            keep_alive: Box::new(lease),
+        }
+    }
+}
+
 // ── Shutdown coordination for detached manifest work ────────────────────────
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Process-global coordination for detached startup-manifest work. Graceful
 /// shutdown first stops NEW continuations from spawning, then drains the
 /// in-flight ones (bounded): their recordings complete and manifests land
-/// instead of being canceled outright. Only a drain timeout force-cancels
-/// what is left.
+/// when possible. A drain timeout sends an abort notification; tasks still
+/// own their leases until their own recorder and continuation cleanup ends.
 struct StartupManifestShutdown {
-    stop_new: AtomicBool,
-    abort: AtomicBool,
-    abort_notify: tokio::sync::Notify,
-    in_flight: AtomicUsize,
-    drained_notify: tokio::sync::Notify,
+    state: Mutex<StartupManifestShutdownState>,
+    abort: tokio::sync::watch::Sender<bool>,
+    in_flight: tokio::sync::watch::Sender<usize>,
 }
 
-fn startup_manifest_shutdown() -> &'static StartupManifestShutdown {
-    static SHUTDOWN: OnceLock<StartupManifestShutdown> = OnceLock::new();
-    SHUTDOWN.get_or_init(|| StartupManifestShutdown {
-        stop_new: AtomicBool::new(false),
-        abort: AtomicBool::new(false),
-        abort_notify: tokio::sync::Notify::new(),
-        in_flight: AtomicUsize::new(0),
-        drained_notify: tokio::sync::Notify::new(),
-    })
+#[derive(Default)]
+struct StartupManifestShutdownState {
+    stop_new: bool,
+    abort: bool,
+    in_flight: usize,
 }
 
-/// True once shutdown was requested: the publish flow must not spawn new
-/// startup-manifest continuations after this point.
-pub fn startup_manifest_shutdown_requested() -> bool {
-    startup_manifest_shutdown().stop_new.load(Ordering::SeqCst)
+impl StartupManifestShutdown {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(StartupManifestShutdownState::default()),
+            abort: tokio::sync::watch::channel(false).0,
+            in_flight: tokio::sync::watch::channel(0).0,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, StartupManifestShutdownState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn try_register(self: &Arc<Self>) -> Option<StartupManifestTaskGuard> {
+        let mut state = self.lock();
+        if state.stop_new {
+            return None;
+        }
+        state.in_flight += 1;
+        self.in_flight.send_replace(state.in_flight);
+        Some(StartupManifestTaskGuard {
+            state: Arc::clone(self),
+        })
+    }
+
+    async fn drain(&self, timeout: std::time::Duration) {
+        let mut receiver = self.in_flight.subscribe();
+        self.lock().stop_new = true;
+        let drained = async {
+            while *receiver.borrow_and_update() != 0 {
+                if receiver.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        if tokio::time::timeout(timeout, drained).await.is_err() {
+            let mut inner = self.lock();
+            if inner.in_flight != 0 {
+                inner.abort = true;
+                self.abort.send_replace(true);
+            }
+        }
+    }
+}
+
+fn startup_manifest_shutdown() -> &'static Arc<StartupManifestShutdown> {
+    static SHUTDOWN: OnceLock<Arc<StartupManifestShutdown>> = OnceLock::new();
+    SHUTDOWN.get_or_init(|| Arc::new(StartupManifestShutdown::new()))
 }
 
 /// True once the drain timed out and remaining work was told to cancel.
 pub fn startup_manifest_abort_requested() -> bool {
-    startup_manifest_shutdown().abort.load(Ordering::SeqCst)
+    startup_manifest_shutdown().lock().abort
 }
 
 /// Notified once [`startup_manifest_abort_requested`] turns true.
-pub fn startup_manifest_abort_notify() -> tokio::sync::futures::Notified<'static> {
-    startup_manifest_shutdown().abort_notify.notified()
+pub async fn startup_manifest_abort_notify() {
+    let mut receiver = startup_manifest_shutdown().abort.subscribe();
+    while !*receiver.borrow_and_update() {
+        if receiver.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Request shutdown: stop spawning new startup-manifest continuations, then
 /// wait (bounded by `timeout`) for the in-flight ones to drain so their
-/// manifests still land. Whatever survives the timeout is force-canceled.
+/// manifests still land. A timeout requests cancellation but does not
+/// synchronously revoke resources still owned by those tasks.
 pub async fn drain_startup_manifest_tasks(timeout: std::time::Duration) {
-    let state = startup_manifest_shutdown();
-    state.stop_new.store(true, Ordering::SeqCst);
-    let drained = async {
-        while state.in_flight.load(Ordering::SeqCst) != 0 {
-            state.drained_notify.notified().await;
-        }
-    };
-    if tokio::time::timeout(timeout, drained).await.is_err()
-        && state.in_flight.load(Ordering::SeqCst) != 0
-    {
-        state.abort.store(true, Ordering::SeqCst);
-        state.abort_notify.notify_waiters();
-    }
+    startup_manifest_shutdown().drain(timeout).await;
 }
 
 /// RAII guard counting one in-flight startup-manifest continuation.
 pub(crate) struct StartupManifestTaskGuard {
-    _private: (),
+    state: Arc<StartupManifestShutdown>,
 }
 
 impl StartupManifestTaskGuard {
-    pub(crate) fn new() -> Self {
-        startup_manifest_shutdown()
-            .in_flight
-            .fetch_add(1, Ordering::SeqCst);
-        Self { _private: () }
+    pub(crate) fn try_register() -> Option<Self> {
+        startup_manifest_shutdown().try_register()
     }
 }
 
 impl Drop for StartupManifestTaskGuard {
     fn drop(&mut self) {
-        let state = startup_manifest_shutdown();
-        if state.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
-            state.drained_notify.notify_waiters();
-        }
+        let mut inner = self.state.lock();
+        inner.in_flight -= 1;
+        self.state.in_flight.send_replace(inner.in_flight);
     }
 }
 
 /// Startup pack descriptor persisted in the committed record when — and only
-/// when — the pack was recorded AND uploaded successfully. Older snapshots
-/// and POSIX-backend snapshots never carry it.
+/// when — the pack was recorded and its repository backend saved the manifest.
+/// It is absent for older snapshots and best-effort recording failures.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryStartupPackInfo {
     pub pack_size: u64,
     pub mem_virtual_size: u64,
-    /// Hex-encoded sha256 of the pack index section (v1: page offsets + block
-    /// crcs; v2: object table + entry table + frame crcs). The consumer
-    /// verifies the received index against this digest before trusting any
-    /// entry.
+    /// Hex-encoded SHA-256 of the complete encoded startup manifest.
+    /// The field name is retained for committed-record compatibility.
     pub index_sha256: String,
 }
 
-/// Runtime-only startup pack reference handed from the OSS resolver to the
-/// sandbox start: everything the daemon needs to register the pack's
-/// prefetch. Never trusted on its own — the daemon verifies the pack's
-/// index against `index_sha256` before importing any block.
+/// Runtime-only startup pack reference handed from a repository resolver to
+/// sandbox start. The source explicitly distinguishes OSS URLs from local
+/// POSIX paths. Never trusted on its own: the consumer verifies the pack's
+/// size, digest and memory geometry before use.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResolvedStartupPackSource {
+    OssUrl(String),
+    LocalPath(PathBuf),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedStartupPack {
-    pub url: String,
+    pub source: ResolvedStartupPackSource,
     pub pack_size: u64,
     pub index_sha256: String,
     pub mem_virtual_size: u64,
@@ -151,7 +212,25 @@ pub fn resolve_startup_pack_ref(
     }
     let info = info?;
     Some(ResolvedStartupPack {
-        url: url(),
+        source: ResolvedStartupPackSource::OssUrl(url()),
+        pack_size: info.pack_size,
+        index_sha256: info.index_sha256.clone(),
+        mem_virtual_size: info.mem_virtual_size,
+    })
+}
+
+/// Resolve a POSIX repository manifest to an explicit local source.
+pub fn resolve_local_startup_pack_ref(
+    info: Option<&MemoryStartupPackInfo>,
+    consume_enabled: bool,
+    path: PathBuf,
+) -> Option<ResolvedStartupPack> {
+    if !consume_enabled {
+        return None;
+    }
+    let info = info?;
+    Some(ResolvedStartupPack {
+        source: ResolvedStartupPackSource::LocalPath(path),
         pack_size: info.pack_size,
         index_sha256: info.index_sha256.clone(),
         mem_virtual_size: info.mem_virtual_size,
@@ -169,9 +248,141 @@ pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     out
 }
 
+/// Build the shared manifest artifact; backends own its persistence/attachment.
+pub(crate) async fn build_startup_manifest(
+    trace_path: &std::path::Path,
+) -> anyhow::Result<(MemoryStartupPackInfo, Vec<u8>)> {
+    use anyhow::Context;
+    use tokio::io::AsyncReadExt;
+    let limit = overlaybd::startup_pack::TRACE_HEADER_BYTES
+        + overlaybd::startup_pack::MAX_TRACE_PAGES as usize * 8;
+    let mut trace = Vec::new();
+    tokio::fs::File::open(trace_path)
+        .await?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut trace)
+        .await?;
+    anyhow::ensure!(trace.len() <= limit, "startup trace too large");
+    tokio::task::spawn_blocking(move || {
+        let (mem_virtual_size, offsets) = overlaybd::startup_pack::decode_trace(&trace)?;
+        let manifest = overlaybd::startup_manifest::build_manifest(mem_virtual_size, &offsets)?;
+        let bytes = overlaybd::startup_manifest::encode_manifest(&manifest)?;
+        let info = MemoryStartupPackInfo {
+            pack_size: bytes.len() as u64,
+            mem_virtual_size,
+            index_sha256: hex_sha256(&bytes),
+        };
+        Ok((info, bytes))
+    })
+    .await
+    .context("startup manifest builder panicked")?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn detached_recording_retains_capture_lease_until_cleanup_finishes() {
+        let lease = Arc::new(());
+        let retained = Arc::downgrade(&lease);
+        let (finish, cleanup) = tokio::sync::oneshot::channel();
+        let recording = StartupRecording {
+            trace: tokio::spawn(async move {
+                let _ = cleanup.await;
+                None
+            }),
+            keep_alive: Box::new(lease),
+        };
+        recording.detach();
+        tokio::task::yield_now().await;
+        let still_retained = retained.upgrade().is_some();
+        finish.send(()).expect("recorder still running");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while retained.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached cleanup releases capture lease");
+        assert!(
+            still_retained,
+            "publication must not release recorder resources"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_manifest_builder_preserves_trace_layout_and_descriptor() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(MEMORY_STARTUP_TRACE_ARTIFACT);
+        let trace = overlaybd::startup_pack::encode_trace(16384, &[8192, 0, 4096])?;
+        tokio::fs::write(&path, trace).await?;
+        let (info, bytes) = build_startup_manifest(&path).await?;
+        let manifest = overlaybd::startup_manifest::decode_manifest(&bytes)?;
+        assert_eq!(info.mem_virtual_size, 16384);
+        assert_eq!(info.pack_size, bytes.len() as u64);
+        assert_eq!(info.index_sha256, hex_sha256(&bytes));
+        assert_eq!(manifest.mem_virtual_size, 16384);
+        assert_eq!(manifest.ranges, vec![(0, 12288)]);
+        assert!(manifest.prefix_pages.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_manifest_builder_rejects_invalid_and_oversized_trace() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(MEMORY_STARTUP_TRACE_ARTIFACT);
+        tokio::fs::write(&path, b"invalid trace").await?;
+        assert!(build_startup_manifest(&path).await.is_err());
+        let limit = overlaybd::startup_pack::TRACE_HEADER_BYTES
+            + overlaybd::startup_pack::MAX_TRACE_PAGES as usize * 8;
+        std::fs::File::create(&path)?.set_len(limit as u64 + 1)?;
+        let error = build_startup_manifest(&path).await.unwrap_err();
+        assert!(error.to_string().contains("startup trace too large"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_admission_and_abort_are_race_free() {
+        let coordinator = Arc::new(StartupManifestShutdown::new());
+        let guard = coordinator
+            .try_register()
+            .expect("admitted before shutdown");
+        let mut in_flight = coordinator.in_flight.subscribe();
+        coordinator.drain(std::time::Duration::ZERO).await;
+        assert!(coordinator.try_register().is_none());
+        assert_eq!(*in_flight.borrow_and_update(), 1);
+        let mut abort = coordinator.abort.subscribe();
+        assert!(
+            *abort.borrow_and_update(),
+            "late subscriber sees prior abort"
+        );
+        drop(guard);
+        in_flight
+            .changed()
+            .await
+            .expect("guard release is observable");
+        assert_eq!(*in_flight.borrow_and_update(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_observes_last_guard_release_without_lost_notification() {
+        let coordinator = Arc::new(StartupManifestShutdown::new());
+        let guard = coordinator.try_register().expect("admitted");
+        let draining = Arc::clone(&coordinator);
+        let task = tokio::spawn(async move {
+            draining.drain(std::time::Duration::from_secs(1)).await;
+        });
+        while !coordinator.lock().stop_new {
+            tokio::task::yield_now().await;
+        }
+        assert!(coordinator.try_register().is_none());
+        drop(guard);
+        task.await.expect("drain task");
+        assert_eq!(coordinator.lock().in_flight, 0);
+        assert!(!coordinator.lock().abort);
+    }
 
     #[test]
     fn committed_snapshot_without_memory_startup_deserializes() {
@@ -228,6 +439,33 @@ mod tests {
         assert_eq!(resolved.pack_size, 4096);
         assert_eq!(resolved.mem_virtual_size, 1 << 30);
         assert_eq!(resolved.index_sha256, "ab".repeat(32));
-        assert!(resolved.url.ends_with("memory-startup.pack"));
+        assert!(
+            matches!(resolved.source, ResolvedStartupPackSource::OssUrl(ref url) if url.ends_with("memory-startup.pack"))
+        );
+    }
+
+    #[test]
+    fn resolve_local_startup_pack_gates_consumption_and_marks_local_source() {
+        let info = MemoryStartupPackInfo {
+            pack_size: 4096,
+            mem_virtual_size: 1 << 30,
+            index_sha256: "ab".repeat(32),
+        };
+        assert!(
+            resolve_local_startup_pack_ref(Some(&info), false, PathBuf::from("/repo/pack"))
+                .is_none()
+        );
+        assert!(resolve_local_startup_pack_ref(None, true, PathBuf::from("/repo/pack")).is_none());
+        let resolved = resolve_local_startup_pack_ref(
+            Some(&info),
+            true,
+            PathBuf::from("/repo/artifacts/id/memory-startup.pack"),
+        )
+        .expect("local descriptor must resolve when consumption is enabled");
+        assert!(matches!(
+            resolved.source,
+            ResolvedStartupPackSource::LocalPath(ref path)
+                if path.ends_with("memory-startup.pack")
+        ));
     }
 }
