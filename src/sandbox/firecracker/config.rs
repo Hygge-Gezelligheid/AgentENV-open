@@ -110,8 +110,6 @@ impl FirecrackerRuntimePolicy {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FirecrackerCommonConfig {
-    /// Node-local launch dependency, resolved from current config before restore.
-    #[serde(skip)]
     pub firecracker_binary: PathBuf,
     /// Immutable release version of the complete tools drive.
     #[serde(default)]
