@@ -8,7 +8,7 @@ coverage so far is Intel; AMD needs a separate run.
 
 Use a host with working nested virtualization and access to `/dev/kvm`. Install
 Python 3.11+, QEMU x86 system binaries, static BusyBox at `/bin/busybox`, cpio,
-e2fsprogs and Bash. Use a fresh test work directory with at least 5 GiB free.
+and Bash. Use a fresh test work directory with at least 5 GiB free.
 
 Install the nested-KVM Firecracker and matching `cpu-template-helper` from the
 same revision (current source pin: `721f05707a41a3337d90b0d6921129b4885aa49a`).
@@ -33,7 +33,8 @@ the helper uses this location even with an explicit Firecracker `binary_path`.
 Use a new version directory when replacing assets. `no-kvmapf` is the workaround
 used in the Intel validation; retain existing boot and DAMON arguments.
 
-Start a dedicated AgentENV server with this config. Isolate its state using
+Start a dedicated AgentENV server on the same host as the test with this config.
+Isolate its state using
 `AENV_HOME_PATH` and `AENV_RUNTIME_PATH`, select its dependencies with
 `AENV_DEPS_PATH`, and use non-overlapping network pools. Bind the API to loopback
 (the commands below use port 18090) and set `[sandbox_proxy].domains`, for
@@ -48,30 +49,26 @@ the kernel memory and arguments captured in existing snapshots.
 
 ## 2. Prepare the image and run the API test
 
-In a Python virtual environment, prepare the image and start its registry:
+In a Python virtual environment, install the SDK, then run one command:
 
 ```sh
 python3 -m pip install -r scripts/tests/nestedvirt-requirements.txt
-python3 scripts/tests/nestedvirt/prepare_probe.py /absolute/path/nestedvirt-work \
-  --inner-kernel /absolute/path/bzImage
-python3 scripts/tests/serve-nestedvirt-fixture.py /absolute/path/nestedvirt-work --port 18091
-```
-
-Preparation bundles QEMU, its libraries, Bash, BusyBox, the inner kernel/initrd,
-and `/start-inner` and `/stop-inner` into `probe-root/` and `probe-root.ext4`.
-The registry packages that root as an OCI image with the AgentENV fixture init.
-`start-inner.sh` launches QEMU with `accel=kvm`; `inner-init.sh` emits a counter.
-
-Keep the registry running. In another terminal using the same environment:
-
-```sh
-python3 scripts/tests/nestedvirt-api-smoke.py \
+python3 scripts/tests/nestedvirt-smoke.py run \
   http://127.0.0.1:18090 /absolute/path/test-home/secrets/api-key \
-  127.0.0.1:18091/nested:latest /absolute/path/evidence --rounds 3 \
-  --config /absolute/path/node.toml --kernel-release EXPECTED_UNAME_R
+  /absolute/path/nestedvirt-work --inner-kernel /absolute/path/bzImage \
+  --config /absolute/path/node.toml --kernel-release EXPECTED_UNAME_R --rounds 3
 ```
 
 Replace `EXPECTED_UNAME_R` with the outer kernel's exact `uname -r` value.
+The runner prepares a fresh temporary OCI image, starts its loopback registry
+(default port 18091; override with `--port` and update the node's regctl setting),
+executes the API test, then closes the registry and removes temporary files.
+It retains results under `nestedvirt-work/evidence/`.
+
+`nestedvirt-guest.sh` supplies the image init, the inner counter program and
+QEMU start/stop operations. QEMU runs with `accel=kvm`. The image contains QEMU,
+its libraries, Bash, static BusyBox, the supplied inner kernel and its initrd.
+
 The runner reads the API key file, builds a two-vCPU/512-MiB template, creates
 a source sandbox and two fork children, then pauses and reconnects the source.
 It tests each of these stages three times:
@@ -90,23 +87,10 @@ Require successful script exit and nine unique phase/round records in
 `api-results.json`. `api-commands.jsonl` records guest commands, kernel release,
 boot arguments and counter growth. Results are published after sandbox/template
 cleanup succeeds. Retain evidence with the source revisions, config and asset
-checksums; rebuild the fixture when its inputs change. Stop the registry and
-test server after the run.
+checksums. Each run prepares a fresh fixture. Stop the dedicated test server
+after the run.
 
-## 3. Optional focused tests
-
-**Direct Firecracker snapshot recovery.** Using the prepared image, this test
-saves the outer VM's state and memory, stops it, and loads the snapshot in a new
-Firecracker process. It checks the same three inner stages and fresh startup.
-
-```sh
-python3 scripts/tests/nestedvirt/raw_smoke.py /absolute/path/nestedvirt-work \
-  --firecracker /absolute/path/firecracker --kernel /absolute/path/vmlinux \
-  --rounds 3
-```
-
-Require successful exit and nine records in `evidence/raw-results.json`.
-Per-VM directories retain serial logs and snapshots.
+## 3. Additional checks
 
 **Old v9 snapshot recovery.** `orchestrator_v9_snapshot_upgrade` in
 `tests/integration/orchestrator.rs` uses the current AgentENV test binary with
@@ -131,6 +115,9 @@ scripts/run-with-capabilities.sh cargo test -p agentenv \
   -- --exact --ignored --nocapture
 ```
 
-**Hosted CI** checks script syntax and OCI fixture rebuilding. The hardware
-matrices above run explicitly on a nested-KVM host. The v9 test is compiled but
+**Hosted CI** checks script syntax and OCI fixture rebuilding through
+`python3 scripts/tests/nestedvirt-smoke.py check-fixture` (also with `-O`).
+This check uses temporary files and a loopback registry; it requires neither
+KVM nor the E2B SDK. The hardware matrix runs explicitly on a nested-KVM host.
+The v9 test is compiled but
 ignored by default because it requires both runtime versions.

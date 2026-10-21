@@ -42,16 +42,13 @@ jobs:
         with:
           python-version: "3.12"
       - name: Check nested KVM smoke syntax
-        run: python3 -m py_compile scripts/tests/nestedvirt-api-smoke.py scripts/tests/serve-nestedvirt-fixture.py scripts/tests/nestedvirt/*.py
-      - name: Check nested KVM guest scripts
         run: |
-          for script in scripts/tests/nestedvirt/*.sh scripts/tests/nestedvirt-fixture-init.sh; do
-            sh -n "$script"
-          done
+          python3 -m py_compile scripts/tests/nestedvirt-smoke.py
+          sh -n scripts/tests/nestedvirt-guest.sh
       - name: Verify real fixture rebuild
         run: |
-          python3 scripts/tests/test-nestedvirt-fixture.py "$RUNNER_TEMP"
-          python3 -O scripts/tests/test-nestedvirt-fixture.py "$RUNNER_TEMP"
+          python3 scripts/tests/nestedvirt-smoke.py check-fixture
+          python3 -O scripts/tests/nestedvirt-smoke.py check-fixture
 
   agentenv-tests:
     runs-on: ubuntu-latest
