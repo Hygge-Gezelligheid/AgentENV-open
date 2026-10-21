@@ -105,10 +105,14 @@ async fn orchestrator_v9_snapshot_upgrade() -> Result<()> {
             assert_snapshot_format(&current_binary, &record["state"], "v9.0.0").await?;
             let missing = root.path().join("removed-old-runtime/firecracker");
             assert!(!missing.exists());
-            let binary = record
-                .pointer_mut("/state/common/firecracker_binary")
-                .ok_or_else(|| anyhow::anyhow!("missing captured binary path"))?;
-            *binary = serde_json::to_value(missing)?;
+            // New records omit the executable; inject the field to model an old record.
+            let common = record
+                .pointer_mut("/state/common")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| anyhow::anyhow!("missing captured common config"))?;
+            assert!(common
+                .insert("firecracker_binary".into(), serde_json::to_value(missing)?)
+                .is_none());
             db.put(&key, serde_json::to_vec(&record)?)?;
             db.flush_wal(true)?;
             // Drop the DB before the resume process opens the paused store.
@@ -373,10 +377,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
                 .expect("paused state")
                 .encode()?;
             let binary = ConfigManager::global_config().resolved_firecracker_binary_path();
-            assert_eq!(
-                state["common"]["firecracker_binary"],
-                serde_json::to_value(&binary)?
-            );
+            assert!(state.pointer("/common/firecracker_binary").is_none());
             assert_snapshot_format(&binary, &state, "v1000.0.0").await?;
         }
         restarted.delete_sandbox(sandbox_id).await?;

@@ -3003,19 +3003,28 @@ mod tests {
             pack_recording: false,
             memory_startup_pack: None,
         };
-        let sandbox = FirecrackerSandbox::from_snapshot_config(&snapshot)?;
-        let restored = sandbox.launch.common();
-        assert_eq!(
-            restored.firecracker_binary,
-            ConfigManager::global_config().resolved_firecracker_binary_path()
-        );
-        assert_eq!(restored.tools_drive_version, "captured-tools");
-        assert_eq!(restored.envd_version, "captured-envd");
-        assert_eq!(
-            serde_json::to_value(&restored.rootfs_image_config)?,
-            serde_json::to_value(rootfs)?
-        );
-        assert_eq!(serde_json::to_value(&restored.extra_drives)?, drives);
+        let mut record = FirecrackerPausedState::new(snapshot).encode()?;
+        assert!(record.pointer("/common/firecracker_binary").is_none());
+        for legacy_binary in [None, Some("/missing/legacy/firecracker")] {
+            if let Some(binary) = legacy_binary {
+                record["common"]["firecracker_binary"] = serde_json::to_value(binary)?;
+            }
+            let snapshot: FirecrackerSnapshotConfig = serde_json::from_value(record.clone())?;
+            assert!(snapshot.common.firecracker_binary.as_os_str().is_empty());
+            let sandbox = FirecrackerSandbox::from_snapshot_config(&snapshot)?;
+            let restored = sandbox.launch.common();
+            assert_eq!(
+                restored.firecracker_binary,
+                ConfigManager::global_config().resolved_firecracker_binary_path()
+            );
+            assert_eq!(restored.tools_drive_version, "captured-tools");
+            assert_eq!(restored.envd_version, "captured-envd");
+            assert_eq!(
+                serde_json::to_value(&restored.rootfs_image_config)?,
+                serde_json::to_value(&rootfs)?
+            );
+            assert_eq!(serde_json::to_value(&restored.extra_drives)?, drives);
+        }
         Ok(())
     }
 
