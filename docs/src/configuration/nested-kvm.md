@@ -1,35 +1,22 @@
-# Nested KVM with a Linux 6.18 guest
+# Nested KVM
 
 An x86_64 AgentENV node can expose `/dev/kvm` inside its sandboxes using
 `kvcache-ai/firecracker` at `721f05707a41a3337d90b0d6921129b4885aa49a`
-and a Linux 6.18 guest kernel with built-in KVM. That Firecracker checkout
-contains the `tools/nestedvirt/` tools and the x86_64 legacy snapshot loader;
-they are not located in the AgentENV checkout. The host must expose
-VMX or SVM and provide working nested virtualization.
-
-The historical Intel hardware candidate was based on
-`c7e1cceb6bf643f239ddac804a535ceb8ac93cb1`, with two outer vCPUs and 512 MiB
-outer memory. That commit does not contain the tools below. Its hardware
-results do not establish validation of binaries rebuilt from the current pin;
-retain the original asset identities and validate the new build separately.
+and a guest kernel with built-in KVM. The host must expose VMX or SVM and
+provide working nested virtualization. The test tools live in this AgentENV
+checkout under `scripts/tests/`; no Firecracker source checkout is needed to run them.
 
 ## Install matching assets
 
-Build Firecracker and `cpu-template-helper` together from that source checkout.
-Build the guest kernel using `tools/nestedvirt/build-kernel.sh` in the matching
-Firecracker checkout. The guest configuration includes KVM, MP-table CPU
-discovery, virtio MMIO command-line device discovery, DAMON reclaim and page
-reporting. Keep the generated configuration, build commands, compiler versions
-and artifact checksums with the deployment.
+Install Firecracker and `cpu-template-helper` built from the same source revision,
+and an uncompressed guest `vmlinux` ELF with built-in KVM. On x86_64 the guest
+also needs MP-table CPU discovery and virtio MMIO command-line device discovery.
+Keep the kernel configuration, source revisions and artifact checksums with the
+deployment. Kernel building and publication are separate from these test tools.
 
-The guest source archive is `linux-6.18.tar.xz`, with SHA-256
-`9106a4605da9e31ff17659d958782b815f9591ab308d03b0ee21aad6c7dced4b`.
-The integration candidate uses generated configuration SHA-256
-`70699be91477f23a86be3fc15d0d138bd8f3ccbe26def6898570d1406739f55a`.
-Record source commits and any local modifications separately from binary
-versions. A source export without Git history has a limited delivery identity.
-Matching current source files to a commit does not establish the original
-compilation inputs or guarantee identical hashes after rebuilding.
+Historical hardware validation used an Intel host, a Linux 6.18 guest, two outer
+vCPUs and 512 MiB outer memory. Validate newly built assets separately; those
+historical results do not verify a new binary.
 
 ## Use the existing node configuration
 
@@ -57,7 +44,7 @@ overrides, not release download URLs.
 | --- | --- |
 | `[firecracker].version` | A distinct local asset identifier, such as `1.15.1-nestedvirt-721f0570`. Use a new identifier if the installed asset bytes change. |
 | `[firecracker].binary_path` | The actual executable path, normally `deps_path/firecracker/<version>/firecracker`. |
-| `[kernel].image_path` | The actual path to the built, uncompressed Linux 6.18 guest ELF. |
+| `[kernel].image_path` | The actual path to the uncompressed guest `vmlinux` ELF with built-in KVM. |
 | `[firecracker].boot_args` | Preserve the complete existing value and append `no-kvmapf`. |
 | `[pool.block].enabled` | `true`, already enabled in the shipped default configuration. |
 
@@ -99,7 +86,8 @@ stalled inner execution in the tested API path.
 
 ## Validate snapshots and the normal API
 
-Run `tools/nestedvirt/raw_smoke.py` from the matching Firecracker checkout.
+Run `scripts/tests/nestedvirt/raw_smoke.py` from this AgentENV checkout with
+explicit Firecracker and outer-kernel paths; see the [test tool instructions](../../../scripts/tests/nestedvirt/README.md).
 Then run the AgentENV smoke against a dedicated node using its existing config and a new template. Each
 path requires three rounds for each of `unused`, `initialized` and `running`.
 QEMU explicitly uses KVM. Two successive execution counter samples must grow
@@ -110,18 +98,20 @@ and starts a fresh inner VM in all three sandboxes. Its running stage also
 checks that existing inner execution advances across fork and pause/connect.
 The initialized stage requires QMP to report KVM enabled/present and a stopped
 `prelaunch` instance before capture and after fork and reconnect. Rebuild the
-fixture with the matching Firecracker tools, which expose QMP on guest loopback
+fixture with the AgentENV tools below, which expose QMP on guest loopback
 port 4444. The initialized stage replaces the restored stopped `-S` inner instance before
 starting the fresh one. Continuing that same initialized inner instance is
 outside this test's coverage.
 
-Prepare the real probe root filesystem using Firecracker's
-`tools/nestedvirt/prepare_probe.py`. It includes static BusyBox, real Bash,
+Prepare the real probe root filesystem using
+`scripts/tests/nestedvirt/prepare_probe.py --inner-kernel /absolute/path/bzImage`. It includes static BusyBox, real Bash,
 QEMU with its shared libraries, an inner kernel and initrd, `/start-inner` and
 `/stop-inner`. Use Python 3.11 or later in a dedicated virtual environment.
 
 ```sh
 python3 -m pip install -r scripts/tests/nestedvirt-requirements.txt
+python3 scripts/tests/nestedvirt/prepare_probe.py /absolute/path/nestedvirt-work \
+  --inner-kernel /absolute/path/bzImage
 python3 scripts/tests/serve-nestedvirt-fixture.py /absolute/path/nestedvirt-work --port 18091
 ```
 
@@ -138,8 +128,12 @@ using the same virtual environment, run the following command. Replace
 python3 scripts/tests/nestedvirt-api-smoke.py \
   http://127.0.0.1:18090 /absolute/path/test-home/secrets/api-key \
   127.0.0.1:18091/nested:latest /absolute/path/evidence --rounds 3 \
-  --config /absolute/path/node.toml
+  --config /absolute/path/node.toml --kernel-release EXPECTED_UNAME_R
 ```
+
+Replace `EXPECTED_UNAME_R` with the release string of the outer guest kernel
+installed on the node. The test checks it exactly and logs the observed value.
+The QEMU inner kernel is a separate bzImage input.
 
 Pass the same node configuration to the smoke and the server. `--config` takes
 precedence over `AENV_CONFIG_PATH`; otherwise the smoke reads

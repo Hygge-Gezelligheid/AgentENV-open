@@ -18,6 +18,7 @@ parser.add_argument("endpoint")
 parser.add_argument("api_key_file", type=Path)
 parser.add_argument("image")
 parser.add_argument("evidence", type=Path)
+parser.add_argument("--kernel-release", required=True, help="Expected outer guest uname -r")
 parser.add_argument("--rounds", type=int, default=3)
 parser.add_argument("--phase", choices=("unused", "initialized", "running"))
 parser.add_argument(
@@ -140,7 +141,7 @@ def check(sandbox):
         sandbox,
         "test -c /dev/kvm && test $(grep -c '^processor' /proc/cpuinfo) -eq 2 && uname -r && cat /proc/cmdline",
     )
-    if "6.18.0-agentenv-nestedvirt" not in text:
+    if args.kernel_release not in text.splitlines():
         raise RuntimeError(f"Wrong guest kernel: {text}")
     missing = set(expected_boot_args) - set(text.split())
     if missing:
