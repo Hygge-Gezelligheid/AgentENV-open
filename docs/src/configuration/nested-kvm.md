@@ -18,9 +18,13 @@ aarch64. Both programs are installed under
 configuration and environment overrides still take precedence.
 Supply two kernel files: an uncompressed **vmlinux ELF for the outer sandbox**,
 with built-in KVM, MP-table CPU discovery and virtio MMIO command-line discovery;
-and a **bzImage for QEMU's inner guest**. Kernel building is a separate task.
-The default guest kernel remains Linux `vmlinux-6.1.175`; configure the nested
-guest kernel explicitly.
+and a **bzImage for QEMU's inner guest**.
+The default guest kernel is temporarily Linux `vmlinux-6.1.175` while the
+prebuilt Linux 6.18 artifact is being prepared. Once it is built and uploaded,
+the x86_64 KVM default will switch to Linux 6.18 and AgentENV will download it
+automatically; users will not need to compile the kernel themselves.
+Until then, this hardware test requires an explicitly configured, prebuilt
+nested-KVM kernel. The planned default switch applies to x86_64 KVM.
 
 Edit the test node's existing TOML configuration:
 
