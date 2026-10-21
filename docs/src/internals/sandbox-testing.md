@@ -607,6 +607,37 @@ their captured kernel and boot arguments, so use fresh templates to test changes
 to either. Hosted CI runs syntax and `check-fixture` checks; the lifecycle matrix
 runs on nested-KVM hardware.
 
+## 4.3) Legacy v9 Snapshot Recovery
+
+`orchestrator_v9_snapshot_upgrade` in `tests/integration/orchestrator.rs` runs the
+current AgentENV test binary with old and current Firecracker processes. It
+saves v9 state, invalidates the recorded executable path, restores with the
+configured runtime, checks envd, and saves again as v1000.
+
+1. Prepare `v9-node.toml` and `current-node.toml` with their respective runtimes
+   and matching helpers. Use absolute paths and the same state, storage,
+   network, guest kernel, and boot arguments in both configurations.
+2. Complete the integration host setup above and build the daemon with
+   `make build-ublk PROFILE=debug`.
+3. Run the test explicitly; it is ignored by default because it needs both
+   runtime versions:
+
+   ```bash
+   AENV_HOME_PATH=/absolute/path/isolated-test/home \
+   AENV_RUNTIME_PATH=/absolute/path/isolated-test/run \
+   AENV_DEPS_PATH=/absolute/path/test-deps \
+   AENV_UBLK_DAEMON_BINARY_PATH="$PWD/target/debug/uvm-ublk-daemon" \
+   AENV_CONFIG_PATH=/absolute/path/current-node.toml \
+   AENV_TEST_V9_CONFIG=/absolute/path/v9-node.toml \
+   scripts/run-with-capabilities.sh cargo test -p agentenv \
+     --test orchestrator_integration orchestrator::orchestrator_v9_snapshot_upgrade \
+     -- --exact --ignored --nocapture
+   ```
+
+For service-upgrade validation, create templates and paused records with the old
+AgentENV binary, stop it, start the new binary against the same state, and verify
+restore, fork, and another pause/resume cycle.
+
 ## 5) Running Custom Scripts
 
 ### Run commands via envd
