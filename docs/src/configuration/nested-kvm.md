@@ -16,21 +16,19 @@ aarch64. Both programs are installed under
 `deps_path/firecracker/1.15.1-nestedvirt-v1/`. Leave `[firecracker].version`,
 `url` and `binary_path` unset to use these managed defaults; explicit
 configuration and environment overrides still take precedence.
-Supply two kernel files: an uncompressed **vmlinux ELF for the outer sandbox**,
-with built-in KVM, MP-table CPU discovery and virtio MMIO command-line discovery;
-and a **bzImage for QEMU's inner guest**.
-The default guest kernel is temporarily Linux `vmlinux-6.1.175` while the
-prebuilt Linux 6.18 artifact is being prepared. Once it is built and uploaded,
-the x86_64 KVM default will switch to Linux 6.18 and AgentENV will download it
-automatically; users will not need to compile the kernel themselves.
-Until then, this hardware test requires an explicitly configured, prebuilt
-nested-KVM kernel. The planned default switch applies to x86_64 KVM.
+The x86_64 KVM default downloads the prebuilt Linux 6.18 uncompressed vmlinux
+ELF from the Firecracker release. It includes built-in KVM, MP-table CPU discovery
+and virtio MMIO command-line discovery; users do not need to compile it.
+Leave `[kernel].image_path`, `version` and `url` unset to use this default.
+The aarch64 KVM and PVM kernel defaults are unchanged.
+Supply a **bzImage for QEMU's inner guest** separately for this hardware test.
+Linux 6.18 is the selected default, not a minimum version required by nested KVM.
 
 Edit the test node's existing TOML configuration:
 
 | Field | Value |
 | --- | --- |
-| `[kernel].image_path` | Absolute path to the outer vmlinux ELF. |
+| `[kernel].image_path` | Leave unset to download the default outer vmlinux; set only for a custom kernel. |
 | `[firecracker].boot_args` | Keep the complete existing string and append `no-kvmapf`. |
 | `[pool.block].enabled` | `true`. |
 
