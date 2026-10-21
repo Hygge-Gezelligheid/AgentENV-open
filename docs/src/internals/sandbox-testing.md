@@ -87,6 +87,9 @@ This document describes the public sandbox API, the global `ConfigManager` under
       - Each sandbox gets its own temporary work directory.
     - `FirecrackerSandbox::resume_from_snapshot_config(&FirecrackerSnapshotConfig)`
       - Creates a new sandbox handle and immediately starts it from a snapshot config.
+      - Uses the node's currently configured Firecracker, whether taking a prewarmed
+        process or starting a new one. Cross-version snapshot compatibility is
+        provided by that Firecracker runtime.
       - Uses `vm_state_path`, the memory overlay image config, and
         `base_rootfs_path` from the config.
       - Returns a running sandbox after Firecracker and envd are ready.
@@ -562,6 +565,47 @@ client API and the binary that setup downloads:
    cargo check -p agentenv
    cargo test -p agentenv --lib
    ```
+
+## 4.2) Nested KVM Validation
+
+`scripts/tests/nestedvirt-smoke.py` builds a test image and exercises template
+restoration, fork, and pause/resume with QEMU running inside an x86_64 sandbox.
+Run it when changing the nested-KVM runtime, snapshot handling, or guest kernel.
+
+1. Use an x86_64 host with nested KVM and an outer guest kernel with built-in
+   KVM. Install Python 3.11+, QEMU x86 system binaries, static BusyBox at
+   `/bin/busybox`, cpio, and Bash. Provide a bootable bzImage for the inner guest
+   and a fresh work directory with at least 5 GiB free.
+2. Prepare a dedicated AgentENV node using the host setup above. Use separate
+   `AENV_HOME_PATH`, `AENV_RUNTIME_PATH`, and network pools; select test assets
+   with `AENV_DEPS_PATH`. Bind the API to loopback and set
+   `[sandbox_proxy].domains`, for example to `["nested.local"]`.
+3. Keep the complete `[firecracker].boot_args` string and append `no-kvmapf`;
+   the runner checks this argument. Set `[pool.block].enabled = true`.
+   Configure regctl for the runner's loopback registry with
+   `--host reg=127.0.0.1:18091,tls=disabled`; match the port to `--port`.
+4. Start the node, then use `python3 scripts/tests/nestedvirt-smoke.py run --help`
+   for SDK installation, parameters, and a complete invocation. Pass the node's
+   TOML file with `--config`, including its effective boot arguments.
+5. Require a successful exit and one result per selected phase and round in
+   `<work>/evidence/api-results.json` (nine with defaults). Guest commands and
+   output are in `api-commands.jsonl`. Stop the test node after the run.
+
+The runner builds one template, then creates a source sandbox and two fork
+children per case. The guest payload `nestedvirt-guest.sh` starts and stops QEMU with `accel=kvm` and supplies
+an inner-guest counter.
+
+| Phase | Recovery check |
+|-------|----------------|
+| `unused` | A fresh inner VM starts after fork and pause/resume. |
+| `initialized` | QEMU created with `-S` retains KVM-enabled `prelaunch` state. |
+| `running` | The inner counter continues advancing after fork and pause/resume. |
+
+Each case also starts and stops a fresh inner VM in the source and both children;
+the initialized case replaces its stopped inner VM. Existing snapshots retain
+their captured kernel and boot arguments, so use fresh templates to test changes
+to either. Hosted CI runs syntax and `check-fixture` checks; the lifecycle matrix
+runs on nested-KVM hardware.
 
 ## 5) Running Custom Scripts
 
