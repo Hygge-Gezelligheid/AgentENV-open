@@ -10,6 +10,10 @@ url = "https://github.com/kvcache-ai/firecracker-next/releases/download/{version
 version = "vmlinux-6.1.175"
 url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/{version}-{arch}"
 
+[kernel.kvm_x86_64]
+version = "vmlinux-6.18-agentenv-nestedvirt"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/v1.15.1-nestedvirt-v1/{version}-{arch}"
+
 [kernel.pvm]
 version = "6.12.33-pvm"
 url = "https://github.com/kvcache-ai/linux/releases/download/pvm-kernel-6.12.33/vmlinux-guest-6.12.33-pvm"
