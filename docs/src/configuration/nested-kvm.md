@@ -10,28 +10,30 @@ Use a host with working nested virtualization and access to `/dev/kvm`. Install
 Python 3.11+, QEMU x86 system binaries, static BusyBox at `/bin/busybox`, cpio,
 and Bash. Use a fresh test work directory with at least 5 GiB free.
 
-Install the nested-KVM Firecracker and matching `cpu-template-helper` from the
-same revision (current source pin: `721f05707a41a3337d90b0d6921129b4885aa49a`).
+The default KVM dependency catalog downloads Firecracker
+`1.15.1-nestedvirt-v1` and its matching `cpu-template-helper` for x86_64 or
+aarch64. Both programs are installed under
+`deps_path/firecracker/1.15.1-nestedvirt-v1/`. Leave `[firecracker].version`,
+`url` and `binary_path` unset to use these managed defaults; explicit
+configuration and environment overrides still take precedence.
 Supply two kernel files: an uncompressed **vmlinux ELF for the outer sandbox**,
 with built-in KVM, MP-table CPU discovery and virtio MMIO command-line discovery;
 and a **bzImage for QEMU's inner guest**. Kernel building is a separate task.
-The default dependency catalog still selects Firecracker `1.15.1-patch-v1` and
-Linux `vmlinux-6.1.175`, so configure the test assets explicitly.
+The default guest kernel remains Linux `vmlinux-6.1.175`; configure the nested
+guest kernel explicitly.
 
 Edit the test node's existing TOML configuration:
 
 | Field | Value |
 | --- | --- |
-| `[firecracker].version` | A unique identifier for the installed build. |
-| `[firecracker].binary_path` | Absolute path to the nested-KVM Firecracker. |
 | `[kernel].image_path` | Absolute path to the outer vmlinux ELF. |
 | `[firecracker].boot_args` | Keep the complete existing string and append `no-kvmapf`. |
 | `[pool.block].enabled` | `true`. |
 
-Place the matching helper at `deps_path/firecracker/<version>/cpu-template-helper`;
-the helper uses this location even with an explicit Firecracker `binary_path`.
-Use a new version directory when replacing assets. `no-kvmapf` is the workaround
-used in the Intel validation; retain existing boot and DAMON arguments.
+For a custom Firecracker build, set its version and binary path, and place the
+matching helper at `deps_path/firecracker/<version>/cpu-template-helper`.
+`no-kvmapf` is the workaround used in the Intel validation; retain existing boot
+and DAMON arguments.
 
 Start a dedicated AgentENV server on the same host as the test with this config.
 Isolate its state using
