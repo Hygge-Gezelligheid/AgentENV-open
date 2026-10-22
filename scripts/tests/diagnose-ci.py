@@ -14,6 +14,8 @@ for name,old_kernel,old_fc,apf in [('current',False,False,False),('no-apf',False
  env=dict(os.environ,AENV_CONFIG_PATH=str(config),AENV_HOME_PATH=str(d/'home'),AENV_RUNTIME_PATH=str(d/'run'),AENV_UBLK_DAEMON_BINARY_PATH=str(P(os.environ.get('CARGO_TARGET_DIR','target')).resolve()/'debug/uvm-ublk-daemon'))
  env['PATH']=str(P(env['AENV_UBLK_DAEMON_BINARY_PATH']).parent)+':'+env['PATH']
  cmd=['scripts/run-with-capabilities.sh','cargo','test','-p','agentenv','--test','integration','fc::microvm_lifecycle_and_snapshot_preserve_disk_state','--','--exact','--nocapture','--test-threads=1']
+ with (evidence/(name+'-setup.log')).open('w') as setup_log:
+  subprocess.run([str(P(env['AENV_UBLK_DAEMON_BINARY_PATH']).parent/'server'),'--config',str(config),'--setup-only'],env=env,stdout=setup_log,stderr=subprocess.STDOUT,check=True)
  started=time.monotonic()
  with (evidence/(name+'.log')).open('w') as log:
   try:code=subprocess.run(cmd,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=220).returncode
