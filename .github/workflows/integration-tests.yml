@@ -24,16 +24,30 @@ jobs:
         run: |
           make build-ublk PROFILE=debug
           cargo test -p agentenv --test integration --no-run
-      - name: Compare runtime and kernel combinations
+      - name: Build isolated Firecracker controls
         run: |
           set -eu
-          mkdir -p /tmp/ci-diag/assets /tmp/ci-diag/evidence
+          mkdir -p /tmp/ci-diag/assets /tmp/ci-diag/evidence /tmp/ci-diag/fc-source
           lscpu > /tmp/ci-diag/evidence/cpu.txt
           uname -a > /tmp/ci-diag/evidence/host.txt
-          curl -fL --retry 3 https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/vmlinux-6.1.175-x86_64 -o /tmp/ci-diag/assets/vmlinux-old
-          curl -fL --retry 3 https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/firecracker-1.15.1-patch-v1-x86_64.tgz -o /tmp/ci-diag/assets/fc-old.tgz
-          tar xf /tmp/ci-diag/assets/fc-old.tgz -C /tmp/ci-diag/assets
-          python3 scripts/tests/diagnose-ci.py
+          curl -fL --retry 3 https://github.com/kvcache-ai/firecracker/archive/6e270502add5fb2c583496bf048e003b8378b015.tar.gz -o /tmp/ci-diag/assets/source.tar.gz
+          tar xf /tmp/ci-diag/assets/source.tar.gz --strip-components=1 -C /tmp/ci-diag/fc-source
+          cd /tmp/ci-diag/fc-source
+          cargo +stable build --locked --release -p firecracker
+          cp target/release/firecracker /tmp/ci-diag/assets/firecracker-control
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          p=Path('src/vmm/src/arch/x86_64/msr.rs')
+          s=p.read_text()
+          needle='    MSR_RANGE!(MSR_IA32_TSX_CTRL),'
+          assert s.count(needle)==1
+          p.write_text(s.replace(needle,needle+'\n    MSR_RANGE!(MSR_IA32_XSS),'))
+          PYCODE
+          cargo +stable build --locked --release -p firecracker
+          cp target/release/firecracker /tmp/ci-diag/assets/firecracker-xss
+          cp src/vmm/src/arch/x86_64/msr.rs /tmp/ci-diag/evidence/candidate-msr.rs
+      - name: Verify original failure and upstream XSS fix
+        run: python3 scripts/tests/diagnose-ci.py
       - name: Upload diagnostic evidence
         if: always()
         uses: actions/upload-artifact@v6
