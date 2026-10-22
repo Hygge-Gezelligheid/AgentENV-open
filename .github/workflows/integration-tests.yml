@@ -32,9 +32,11 @@ jobs:
           uname -a > /tmp/ci-diag/evidence/host.txt
           curl -fL --retry 3 https://github.com/kvcache-ai/firecracker/archive/6e270502add5fb2c583496bf048e003b8378b015.tar.gz -o /tmp/ci-diag/assets/source.tar.gz
           tar xf /tmp/ci-diag/assets/source.tar.gz --strip-components=1 -C /tmp/ci-diag/fc-source
+          sudo apt-get update -qq
+          sudo apt-get install -y libseccomp-dev
           cd /tmp/ci-diag/fc-source
           cargo +stable build --locked --release -p firecracker
-          cp target/release/firecracker /tmp/ci-diag/assets/firecracker-control
+          cp build/cargo_target/release/firecracker /tmp/ci-diag/assets/firecracker-control
           python3 - <<'PYCODE'
           from pathlib import Path
           p=Path('src/vmm/src/arch/x86_64/msr.rs')
@@ -44,7 +46,7 @@ jobs:
           p.write_text(s.replace(needle,needle+'\n    MSR_RANGE!(MSR_IA32_XSS),'))
           PYCODE
           cargo +stable build --locked --release -p firecracker
-          cp target/release/firecracker /tmp/ci-diag/assets/firecracker-xss
+          cp build/cargo_target/release/firecracker /tmp/ci-diag/assets/firecracker-xss
           cp src/vmm/src/arch/x86_64/msr.rs /tmp/ci-diag/evidence/candidate-msr.rs
       - name: Verify original failure and upstream XSS fix
         run: python3 scripts/tests/diagnose-ci.py
