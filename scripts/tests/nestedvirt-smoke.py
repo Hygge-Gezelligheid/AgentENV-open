@@ -437,22 +437,49 @@ def run_api(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="Use 'run --help' for installation and invocation examples.",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("check-fixture", help="Check OCI rebuilding without KVM")
-    run = commands.add_parser("run", help="Prepare the fixture and run the API matrix")
-    run.add_argument("endpoint")
-    run.add_argument("api_key_file", type=Path)
-    run.add_argument("work", type=Path)
-    run.add_argument("--inner-kernel", type=Path, required=True)
+    run = commands.add_parser(
+        "run",
+        help="Prepare the fixture and run the API matrix",
+        description="Test nested KVM through a running AgentENV node on this host.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=r"""Setup and example (run from the repository root):
+  Prepare the node as described in docs/src/internals/sandbox-testing.md,
+  section 4.2. In a Python virtual environment, install the SDK:
+    python3 -m pip install 'e2b==2.55.1'
+
+  python3 scripts/tests/nestedvirt-smoke.py run \
+    http://127.0.0.1:18090 /absolute/path/test-home/secrets/api-key \
+    /absolute/path/nestedvirt-work --inner-kernel /absolute/path/bzImage \
+    --config /absolute/path/node.toml --kernel-release EXPECTED_UNAME_R --rounds 3
+
+  Replace EXPECTED_UNAME_R with the outer guest's exact uname -r.
+  Results and guest-command logs are written to WORK/evidence/.
+  The runner removes its image fixture, registry, sandboxes and template.
+  Stop the dedicated AgentENV node after the test.
+""",
+    )
+    run.add_argument("endpoint", help="HTTP API URL of the running local test node")
+    run.add_argument("api_key_file", type=Path, help="File containing the node's API key")
+    run.add_argument("work", type=Path, help="Test work directory; results go in evidence/")
+    run.add_argument("--inner-kernel", type=Path, required=True,
+                     help="Path to the inner QEMU guest's bootable bzImage")
     run.add_argument("--kernel-release", required=True, help="Expected outer guest uname -r")
-    run.add_argument("--port", type=int, default=18091, help="Loopback registry port")
-    run.add_argument("--rounds", type=int, default=3)
-    run.add_argument("--phase", choices=("unused", "initialized", "running"))
+    run.add_argument("--port", type=int, default=18091,
+                     help="Loopback registry port; match the node's regctl config (default: 18091)")
+    run.add_argument("--rounds", type=int, default=3, help="Rounds per phase (default: 3)")
+    run.add_argument("--phase", choices=("unused", "initialized", "running"),
+                     help="Select one inner-VM phase (default: all three)")
     run.add_argument(
         "--config", type=Path,
         default=Path(os.environ.get("AENV_CONFIG_PATH")
                      or Path(__file__).resolve().parents[2] / "config/default.toml"),
+        help="Node TOML with effective boot_args (default: AENV_CONFIG_PATH or config/default.toml)",
     )
     args = parser.parse_args()
     if args.command == "check-fixture":

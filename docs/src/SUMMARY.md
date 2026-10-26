@@ -74,7 +74,6 @@
 
 - [Configuration Reference](./configuration/reference.md)
 - [Environment Variables](./configuration/env-vars.md)
-- [Nested KVM](./configuration/nested-kvm.md)
 
 ---
 
