@@ -27,8 +27,6 @@ virtualization_mode = "kvm"
 # Use an existing Firecracker executable instead of downloading one. It must
 # be a readable, non-empty, executable regular file.
 # binary_path = "/opt/agentenv/bin/firecracker"
-# Managed downloads include the matching cpu-template-helper. For a custom build,
-# install its helper under deps_path/firecracker/<version>/.
 
 # Complete kernel command line passed to guest VMs. Editing it replaces the
 # shipped boot and DAMON reclaim settings; it does not append to them.
