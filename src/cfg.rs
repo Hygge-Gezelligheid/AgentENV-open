@@ -2075,7 +2075,7 @@ mod tests {
         assert_eq!(
             config.resolved_kernel_image_path(),
             PathBuf::from("/deps/kernel")
-                .join(&manifest.kernel.for_mode(VirtualizationMode::Kvm).version)
+                .join(&manifest.kernel.kvm.version)
                 .join("vmlinux.bin")
         );
 
