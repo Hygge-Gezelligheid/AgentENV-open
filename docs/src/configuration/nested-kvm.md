@@ -11,16 +11,17 @@ Python 3.11+, QEMU x86 system binaries, static BusyBox at `/bin/busybox`, cpio,
 and Bash. Use a fresh test work directory with at least 5 GiB free.
 
 The default KVM dependency catalog downloads Firecracker
-`1.15.1-nestedvirt-v1` and its matching `cpu-template-helper` for x86_64 or
+`1.15.1-patch-v2` and its matching `cpu-template-helper` for x86_64 or
 aarch64. Both programs are installed under
-`deps_path/firecracker/1.15.1-nestedvirt-v1/`. Leave `[firecracker].version`,
+`deps_path/firecracker/1.15.1-patch-v2/`. Leave `[firecracker].version`,
 `url` and `binary_path` unset to use these managed defaults; explicit
 configuration and environment overrides still take precedence.
-The x86_64 KVM default downloads the prebuilt Linux 6.18 uncompressed vmlinux
-ELF from the Firecracker release. It includes built-in KVM, MP-table CPU discovery
-and virtio MMIO command-line discovery; users do not need to compile it.
-Leave `[kernel].image_path`, `version` and `url` unset to use this default.
-The aarch64 KVM and PVM kernel defaults are unchanged.
+The KVM default downloads a prebuilt Linux 6.18 kernel for x86_64 or aarch64
+from the Firecracker release; users do not need to compile it. The x86_64
+vmlinux ELF includes built-in KVM, MP-table CPU discovery and virtio MMIO
+command-line discovery. The aarch64 asset is an uncompressed ARM64 Image for
+ordinary KVM guests. Leave `[kernel].image_path`, `version` and `url` unset to
+use these managed defaults. The PVM kernel default is unchanged.
 Supply a **bzImage for QEMU's inner guest** separately for this hardware test.
 Linux 6.18 is the selected default, not a minimum version required by nested KVM.
 

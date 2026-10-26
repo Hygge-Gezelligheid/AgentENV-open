@@ -56,7 +56,7 @@ socket_poll_ms = 1
 # Use an existing uncompressed Linux kernel image instead of downloading one.
 # The file must be a readable, non-empty regular file.
 # image_path = "/opt/agentenv/vmlinux.bin"
-# x86_64 KVM downloads the prebuilt Linux 6.18 kernel with built-in KVM by default.
+# KVM downloads the prebuilt Linux 6.18 kernel for the host architecture by default.
 # Leave image_path unset for managed downloads; see configuration/nested-kvm.md.
 
 [tools]
