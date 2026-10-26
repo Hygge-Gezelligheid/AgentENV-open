@@ -57,7 +57,7 @@ the kernel memory and arguments captured in existing snapshots.
 In a Python virtual environment, install the SDK, then run one command:
 
 ```sh
-python3 -m pip install -r scripts/tests/nestedvirt-requirements.txt
+python3 -m pip install 'e2b==2.55.1'
 python3 scripts/tests/nestedvirt-smoke.py run \
   http://127.0.0.1:18090 /absolute/path/test-home/secrets/api-key \
   /absolute/path/nestedvirt-work --inner-kernel /absolute/path/bzImage \
