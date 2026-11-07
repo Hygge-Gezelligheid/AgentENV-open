@@ -367,16 +367,32 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
             expected_snapshot_path.display(),
             actual_snapshot_path.display()
         );
-        Some(image_config.lowers.pop().expect("checked latest lower"))
+        let mut lower = image_config.lowers.pop().expect("checked latest lower");
+        let destination = output_dir.join(
+            snapshot_layer_path
+                .file_name()
+                .context("sealed layer filename")?,
+        );
+        if snapshot_layer_path != destination {
+            link_or_copy_runtime_layer(snapshot_layer_path, &destination).await?;
+            fs::File::open(&destination)?.sync_all()?;
+        }
+        lower.file = destination.display().to_string();
+        Some(lower)
     } else {
         None
     };
 
-    let rewritten_lowers = rewrite_lowers_with_owned_runtime_suffix(
+    let mut runtime_roots = canonicalized_runtime_owned_roots().to_vec();
+    if let Some(parent) = live_runtime_image_config_path.parent() {
+        runtime_roots.push(fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()));
+    }
+    let rewritten_lowers = rewrite_lowers_with_runtime_roots(
         image_config.lowers,
         output_dir,
         appended_layer,
         MANAGED_BASE_LAYER_FILE,
+        &runtime_roots,
         // Sealed rootfs layers always stay raw; compression happens once at
         // publish time under `[snapshot.publish_compression]`.
         OverlaybdCompactOutput::Raw,
@@ -393,24 +409,6 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     Ok(output_path)
 }
 
-async fn rewrite_lowers_with_owned_runtime_suffix(
-    existing_lowers: Vec<LayerConfig>,
-    output_dir: &Path,
-    appended_layer: Option<LayerConfig>,
-    compaction_output_name: &'static str,
-    compaction_output: OverlaybdCompactOutput,
-) -> Result<Vec<LayerConfig>> {
-    rewrite_lowers_with_runtime_roots(
-        existing_lowers,
-        output_dir,
-        appended_layer,
-        compaction_output_name,
-        canonicalized_runtime_owned_roots(),
-        compaction_output,
-    )
-    .await
-}
-
 async fn rewrite_lowers_with_runtime_roots(
     existing_lowers: Vec<LayerConfig>,
     output_dir: &Path,
@@ -419,9 +417,26 @@ async fn rewrite_lowers_with_runtime_roots(
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
 ) -> Result<Vec<LayerConfig>> {
-    let (mut lowers, mut runtime_owned_lowers) =
-        split_runtime_suffix(existing_lowers, runtime_owned_roots);
+    let (lowers, runtime_owned_lowers) = split_runtime_suffix(existing_lowers, runtime_owned_roots);
+    rewrite_partitioned_lowers(
+        lowers,
+        runtime_owned_lowers,
+        output_dir,
+        appended_layer,
+        compaction_output_name,
+        compaction_output,
+    )
+    .await
+}
 
+async fn rewrite_partitioned_lowers(
+    mut lowers: Vec<LayerConfig>,
+    mut runtime_owned_lowers: Vec<LayerConfig>,
+    output_dir: &Path,
+    appended_layer: Option<LayerConfig>,
+    compaction_output_name: &'static str,
+    compaction_output: OverlaybdCompactOutput,
+) -> Result<Vec<LayerConfig>> {
     // Compact the runtime-owned suffix plus the appended layer once their count
     // exceeds a budget that shrinks as the stable prefix grows: the full
     // `DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS` with an empty prefix, one less per
@@ -494,25 +509,15 @@ async fn capture_live_overlaybd_snapshot(
         .context("resolve restack source upper path")?;
     let snapshot_layer_path = output_dir.join(snapshot_layer_file_name);
     prepare_specific_snapshot_layer_path(&snapshot_layer_path).await?;
-    let live_snapshot_layer_path = if on_same_filesystem(&live_upper_data_path, output_dir)
-        .context("validate restack snapshot filesystem precondition")?
-    {
-        snapshot_layer_path.clone()
-    } else {
-        let live_snapshot_layer_path = live_upper_data_path
-            .parent()
-            .context("restack source upper path has no parent directory")?
-            .join(snapshot_layer_file_name);
-        prepare_specific_snapshot_layer_path(&live_snapshot_layer_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "prepare same-filesystem restack snapshot layer {}",
-                    live_snapshot_layer_path.display()
-                )
-            })?;
-        live_snapshot_layer_path
-    };
+    // The live device must retain its own immutable lowers even when a
+    // caller discards a capture directory or publication fails.
+    let sealed_dir = live_upper_data_path
+        .parent()
+        .context("live upper parent")?
+        .join("sealed")
+        .join(uuid::Uuid::now_v7().to_string());
+    tokio::fs::create_dir_all(&sealed_dir).await?;
+    let live_snapshot_layer_path = sealed_dir.join(snapshot_layer_file_name);
 
     let descriptor = UblkDeviceManager::global()
         .restack_snapshot_device(ublk_device, &live_snapshot_layer_path, kind)
@@ -524,14 +529,21 @@ async fn capture_live_overlaybd_snapshot(
         // untouched and surface a terminal pause failure. The daemon has
         // already sealed the old upper and reopened a fresh one, so callers
         // must not continue treating the live runtime as safely resumable.
-        copy_file_atomically(
-            &live_snapshot_layer_path,
-            &snapshot_layer_path,
-            "restack snapshot layer",
-        )
-        .await
-        .context("copy restack snapshot layer into managed snapshot dir")
-        .map_err(into_terminal_snapshot_failure)?;
+        if on_same_filesystem(&live_snapshot_layer_path, output_dir)
+            .map_err(into_terminal_snapshot_failure)?
+        {
+            link_or_copy_runtime_layer(&live_snapshot_layer_path, &snapshot_layer_path)
+                .await
+                .map_err(into_terminal_snapshot_failure)?;
+        } else {
+            copy_file_atomically(
+                &live_snapshot_layer_path,
+                &snapshot_layer_path,
+                "restack snapshot layer",
+            )
+            .await
+            .map_err(into_terminal_snapshot_failure)?;
+        }
     }
 
     if let Some(descriptor) = descriptor.as_ref() {
@@ -559,18 +571,21 @@ async fn capture_live_overlaybd_snapshot(
 
     rewrite_live_runtime_config_for_restack(
         live_runtime_image_config_path,
-        &snapshot_layer_path,
+        &live_snapshot_layer_path,
         descriptor.as_ref(),
     )
     .await
     .context("rewrite live runtime config after restack snapshot")
     .map_err(into_terminal_snapshot_failure)?;
 
-    Ok(LiveOverlaybdSnapshotState::Restacked(snapshot_layer_path))
+    Ok(LiveOverlaybdSnapshotState::Restacked(
+        live_snapshot_layer_path,
+    ))
 }
 
 pub(super) async fn build_mem_snapshot_image_config(
     resume_mem_image_config_path: Option<&Path>,
+    stable_prefix_len: Option<usize>,
     new_layer_path: &Path,
     output_dir: &Path,
     memory_output: OverlaybdCompactOutput,
@@ -578,8 +593,34 @@ pub(super) async fn build_mem_snapshot_image_config(
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
     let new_layer = local_layer_config(new_layer_path);
-    let lowers = rewrite_lowers_with_owned_runtime_suffix(
-        inherited_image_config.lowers,
+    let (mut stable, runtime) = if let Some(count) = stable_prefix_len {
+        let mut lowers = inherited_image_config.lowers;
+        ensure!(
+            count <= lowers.len(),
+            "invalid memory baseline stable prefix"
+        );
+        let runtime = lowers.split_off(count);
+        (lowers, runtime)
+    } else {
+        split_runtime_suffix(
+            inherited_image_config.lowers,
+            canonicalized_runtime_owned_roots(),
+        )
+    };
+    // Retained stable layers are local links too: give the capture independent
+    // ownership without charging them to the incremental compaction budget.
+    for (index, lower) in stable.iter_mut().enumerate() {
+        if !lower.file.is_empty() {
+            let destination = output_dir
+                .join("stable-layers")
+                .join(format!("{index:04}.commit"));
+            link_or_copy_runtime_layer(Path::new(&lower.file), &destination).await?;
+            lower.file = destination.display().to_string();
+        }
+    }
+    let lowers = rewrite_partitioned_lowers(
+        stable,
+        runtime,
         output_dir,
         Some(new_layer),
         "mem_compacted.commit",
@@ -592,6 +633,76 @@ pub(super) async fn build_mem_snapshot_image_config(
         lowers,
         ..Default::default()
     })
+}
+
+/// Preserve the compaction boundary when local layers move into owned storage.
+pub(super) fn memory_stable_prefix_len(source: &Path) -> Result<usize> {
+    let image = load_existing_image_config(Some(source), "memory baseline")?;
+    Ok(
+        split_runtime_suffix(image.lowers, canonicalized_runtime_owned_roots())
+            .0
+            .len(),
+    )
+}
+
+/// Own local lowers independently of capture/publication directory cleanup.
+/// Remote descriptors retain existing repository resolution.
+pub(super) async fn retain_memory_baseline(source: &Path, directory: &Path) -> Result<PathBuf> {
+    let mut image = load_existing_image_config(Some(source), "memory baseline")?;
+    for (index, lower) in image.lowers.iter_mut().enumerate() {
+        if !lower.file.is_empty() {
+            let destination = directory.join(format!("{index:04}.commit"));
+            link_or_copy_runtime_layer(Path::new(&lower.file), &destination).await?;
+            // The running instance needs ownership of completed immutable
+            // bytes, not a second durability barrier. Repository publication
+            // provides crash recovery; this private baseline has no restart record.
+            lower.file = destination.display().to_string();
+        }
+    }
+    let path = directory.join("image.json");
+    write_bytes_atomically(&path, &serde_json::to_vec(&image)?, "memory baseline")?;
+    fs::File::open(directory)?.sync_all()?;
+    Ok(path)
+}
+
+/// Describe immutable raw parents once, after the source resumes. Publication
+/// already accepts trusted capture descriptors, so later generations can reuse
+/// them instead of rereading every inherited layer for every publication.
+pub(super) async fn refresh_memory_descriptors(baseline: &Path, capture: &Path) -> Result<()> {
+    let baseline = baseline.to_path_buf();
+    let capture = capture.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut image = load_existing_image_config(Some(&baseline), "memory baseline")?;
+        for layer in &mut image.lowers {
+            if !layer.file.is_empty() && (layer.digest.is_empty() || layer.size == 0) {
+                let descriptor =
+                    crate::digest::FileDigest::describe_blocking(Path::new(&layer.file))?;
+                layer.digest = descriptor.sha256;
+                layer.size = descriptor.size;
+            }
+        }
+        let mut captured = load_existing_image_config(Some(&capture), "memory capture")?;
+        ensure!(
+            captured.lowers.len() == image.lowers.len(),
+            "memory baseline/capture layer count differs"
+        );
+        for (lower, descriptor) in captured.lowers.iter_mut().zip(&image.lowers) {
+            lower.digest.clone_from(&descriptor.digest);
+            lower.size = descriptor.size;
+        }
+        write_bytes_atomically(
+            &baseline,
+            &serde_json::to_vec(&image)?,
+            "memory baseline descriptors",
+        )?;
+        write_bytes_atomically(
+            &capture,
+            &serde_json::to_vec(&captured)?,
+            "memory capture descriptors",
+        )
+    })
+    .await
+    .context("describe memory layers task failed")?
 }
 
 /// Stage a persisted snapshot config from the current live overlaybd runtime.
@@ -807,6 +918,142 @@ mod tests {
     use bytes::Bytes;
     use firecracker_client::models::DirtyMemoryRange;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn memory_baseline_survives_capture_cleanup_and_preserves_descriptors() {
+        let capture = tempfile::tempdir().unwrap();
+        let baseline = tempfile::tempdir().unwrap();
+        let layer = capture.path().join("delta.commit");
+        fs::write(&layer, b"committed memory").unwrap();
+        let config = capture.path().join("image.json");
+        let image = json!({
+            "repoBlobUrl": "https://example.invalid/blobs/",
+            "lowers": [
+                {"digest": "sha256:remote", "size": 100},
+                {"file": layer, "digest": "sha256:local", "size": 16}
+            ]
+        });
+        fs::write(&config, serde_json::to_vec(&image).unwrap()).unwrap();
+        let retained = retain_memory_baseline(&config, baseline.path())
+            .await
+            .unwrap();
+        let retained = load_existing_image_config(Some(&retained), "test").unwrap();
+        let inode = fs::metadata(&layer).unwrap().ino();
+        assert_eq!(fs::metadata(&retained.lowers[1].file).unwrap().ino(), inode);
+        drop(capture);
+        assert_eq!(
+            fs::read(&retained.lowers[1].file).unwrap(),
+            b"committed memory"
+        );
+        assert_eq!(retained.lowers[0].digest, "sha256:remote");
+        assert_eq!(retained.lowers[1].digest, "sha256:local");
+        assert_eq!(retained.lowers[1].size, 16);
+    }
+
+    #[tokio::test]
+    async fn memory_baseline_keeps_stable_prefix_out_of_compaction() {
+        let source = tempfile::tempdir().unwrap();
+        let base = seal_raw_test_layer(source.path(), "base", 8192, &[(0, 0xA5)]).await;
+        let base_inode = fs::metadata(&base).unwrap().ino();
+        let source_config = source.path().join("image.json");
+        fs::write(
+            &source_config,
+            serde_json::to_vec(&ImageConfig {
+                lowers: vec![local_layer_config(&base)],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut baseline = tempfile::tempdir().unwrap();
+        retain_memory_baseline(&source_config, baseline.path())
+            .await
+            .unwrap();
+        drop(source);
+        let mut compacted = false;
+        for generation in 0..40 {
+            let capture = tempfile::tempdir().unwrap();
+            let delta =
+                seal_raw_test_layer(capture.path(), "delta", 8192, &[(4096, generation + 1)]).await;
+            let image = build_mem_snapshot_image_config(
+                Some(&baseline.path().join("image.json")),
+                Some(1),
+                &delta,
+                capture.path(),
+                OverlaybdCompactOutput::Raw,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                fs::metadata(&image.lowers[0].file).unwrap().ino(),
+                base_inode
+            );
+            compacted |= capture.path().join("mem_compacted.commit").exists();
+            let config = capture.path().join("image.json");
+            fs::write(&config, serde_json::to_vec(&image).unwrap()).unwrap();
+            let next = tempfile::tempdir().unwrap();
+            retain_memory_baseline(&config, next.path()).await.unwrap();
+            baseline = next;
+        }
+        assert!(compacted);
+    }
+
+    #[tokio::test]
+    async fn memory_descriptors_match_owned_bytes_and_keep_capture_paths() {
+        let capture = tempfile::tempdir().unwrap();
+        let baseline = tempfile::tempdir().unwrap();
+        let layer = capture.path().join("delta.commit");
+        fs::write(&layer, b"immutable exported bytes").unwrap();
+        let capture_config = capture.path().join("image.json");
+        fs::write(
+            &capture_config,
+            serde_json::to_vec(&ImageConfig {
+                lowers: vec![local_layer_config(&layer)],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let baseline_config = retain_memory_baseline(&capture_config, baseline.path())
+            .await
+            .unwrap();
+        refresh_memory_descriptors(&baseline_config, &capture_config)
+            .await
+            .unwrap();
+        let expected = crate::digest::FileDigest::describe_blocking(&layer).unwrap();
+        let captured = load_existing_image_config(Some(&capture_config), "test").unwrap();
+        let owned = load_existing_image_config(Some(&baseline_config), "test").unwrap();
+        assert_eq!(captured.lowers[0].file, layer.display().to_string());
+        assert_ne!(owned.lowers[0].file, captured.lowers[0].file);
+        assert_eq!(captured.lowers[0].digest, expected.sha256);
+        assert_eq!(owned.lowers[0].digest, expected.sha256);
+        assert_eq!(owned.lowers[0].size, expected.size);
+        drop(capture);
+        assert_eq!(
+            crate::digest::FileDigest::describe_blocking(Path::new(&owned.lowers[0].file)).unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_baseline_failure_leaves_previous_generation_readable() {
+        let source = tempfile::tempdir().unwrap();
+        let old = tempfile::tempdir().unwrap();
+        let next = tempfile::tempdir().unwrap();
+        let layer = source.path().join("delta.commit");
+        fs::write(&layer, b"old baseline").unwrap();
+        let config = source.path().join("image.json");
+        fs::write(
+            &config,
+            serde_json::to_vec(&json!({"lowers": [{"file": layer}]})).unwrap(),
+        )
+        .unwrap();
+        let retained = retain_memory_baseline(&config, old.path()).await.unwrap();
+        fs::remove_file(&layer).unwrap();
+        assert!(retain_memory_baseline(&config, next.path()).await.is_err());
+        let retained = load_existing_image_config(Some(&retained), "test").unwrap();
+        assert_eq!(fs::read(&retained.lowers[0].file).unwrap(), b"old baseline");
+    }
 
     #[test]
     fn dirty_ranges_to_segment_mappings_splits_large_ranges() {
@@ -1096,6 +1343,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_baseline_96_generations_preserve_zeros_and_survive_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let mut baseline: Option<tempfile::TempDir> = None;
+        let mut expected = vec![0u8; 16 * 4096];
+        let mut compactions = 0;
+        for generation in 0..96 {
+            let capture = tempfile::tempdir_in(root.path()).unwrap();
+            let offset = (generation % 16) * 4096;
+            let value = if generation % 3 == 0 {
+                0
+            } else {
+                generation as u8 + 1
+            };
+            expected[offset..offset + 4096].fill(value);
+            let delta = seal_raw_test_layer(
+                capture.path(),
+                "delta",
+                expected.len() as u64,
+                &[(offset as u64, value)],
+            )
+            .await;
+            let previous = baseline.as_ref().map(|dir| dir.path().join("image.json"));
+            let image = build_mem_snapshot_image_config(
+                previous.as_deref(),
+                Some(0),
+                &delta,
+                capture.path(),
+                OverlaybdCompactOutput::Raw,
+            )
+            .await
+            .unwrap();
+            if capture.path().join("mem_compacted.commit").exists() {
+                compactions += 1;
+            }
+            let path = capture.path().join("image.json");
+            fs::write(&path, serde_json::to_vec(&image).unwrap()).unwrap();
+            let next = tempfile::tempdir_in(root.path()).unwrap();
+            let next_path = retain_memory_baseline(&path, next.path()).await.unwrap();
+            baseline = Some(next);
+            drop(capture);
+            let image = load_existing_image_config(Some(&next_path), "test").unwrap();
+            let files: Vec<Arc<dyn VirtualFile>> = image
+                .lowers
+                .iter()
+                .map(|lower| {
+                    Arc::new(LocalFile::open_ro(&lower.file).unwrap()) as Arc<dyn VirtualFile>
+                })
+                .collect();
+            let restored = overlaybd::index_file::open_files_ro(&files).await.unwrap();
+            assert_eq!(
+                restored.read_at(0, expected.len()).await.unwrap().as_ref(),
+                expected.as_slice(),
+                "generation {generation}"
+            );
+        }
+        assert!(compactions >= 2);
+    }
+
+    #[tokio::test]
     async fn rewrite_shrinking_budget_compacts_runtime_suffix() {
         let temp = tempfile::tempdir().expect("tempdir");
         let runtime_root = temp.path().join("runtime");
@@ -1136,6 +1442,48 @@ mod tests {
         assert_eq!(compacted, output_dir.join(MANAGED_BASE_LAYER_FILE));
         assert!(compacted.exists());
         assert!(!compacted.with_extension("commit.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn stage_live_runtime_owns_sealed_layers_after_previous_capture_deletion() {
+        let live = tempfile::tempdir().unwrap();
+        let previous = tempfile::tempdir().unwrap();
+        let next = tempfile::tempdir().unwrap();
+        let layer = live.path().join("sealed.commit");
+        fs::write(&layer, b"first generation disk").unwrap();
+        let config = live.path().join("image.json");
+        fs::write(
+            &config,
+            serde_json::to_vec(&ImageConfig {
+                lowers: vec![local_layer_config(&layer)],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        stage_overlaybd_snapshot_from_live_runtime(&config, previous.path(), Some(&layer))
+            .await
+            .unwrap();
+        let next_layer = live.path().join("second.commit");
+        fs::write(&next_layer, b"second generation disk").unwrap();
+        rewrite_live_runtime_config_for_restack(&config, &next_layer, None)
+            .await
+            .unwrap();
+        let staged =
+            stage_overlaybd_snapshot_from_live_runtime(&config, next.path(), Some(&next_layer))
+                .await
+                .unwrap();
+        drop(previous);
+        drop(live);
+        let image = load_existing_image_config(Some(&staged), "test").unwrap();
+        assert_eq!(
+            fs::read(&image.lowers[0].file).unwrap(),
+            b"first generation disk"
+        );
+        assert_eq!(
+            fs::read(&image.lowers[1].file).unwrap(),
+            b"second generation disk"
+        );
     }
 
     #[tokio::test]
@@ -1214,6 +1562,7 @@ mod tests {
         std::fs::write(&new_layer, b"memory delta").expect("write mem layer");
         let image_config = build_mem_snapshot_image_config(
             Some(&parent_config_path),
+            None,
             &new_layer,
             temp.path(),
             OverlaybdCompactOutput::Raw,
