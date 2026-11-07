@@ -14,7 +14,8 @@ following inputs under an experiment directory:
 ```text
 bin/baseline/server
 bin/candidate/server
-bin/uvm-ublk-daemon
+bin/baseline/uvm-ublk-daemon
+bin/candidate/uvm-ublk-daemon
 runtime-target/x86_64-unknown-linux-musl/release/firecracker
 hardware/deps/kernel/vmlinux-6.18/vmlinux.bin
 hardware/deps/tools/0.1.1/tools.ext4
@@ -29,7 +30,8 @@ Create the two seed templates with the ignored
 `AENV_CLEAR_TEST_IMAGE_CONFIG`, and `AENV_CLEAR_SEED_MEMORY_MIB=512` or `4096`.
 Set `AENV_CLEAR_SEED_OUTPUT` to the corresponding JSON path above. The benchmark
 uses published templates, so timed trials do not pull or convert OCI images.
-Both variants use the same curated seed records and blobs.
+Both variants use the same curated seed records and blobs. Each variant uses
+its matching server and daemon build; both daemon hashes are recorded.
 
 ```bash
 python3 scripts/benchmarks/run_clear_comparison.py \
@@ -72,6 +74,9 @@ Measurements include:
 - Actual repository occupancy after deleting earlier snapshot records. This
   includes any unreferenced managed blobs retained by the existing repository;
   deleting records does not establish that blob garbage collection occurred.
+  Referenced managed-layer bytes are also counted from the remaining catalog,
+  with seeded input reported separately. This is a live-reference measurement,
+  not an observation of garbage collection reclaiming space.
 
 Every trial verifies the latest payload through restore and again after
 source deletion and earlier-record deletion. The separate hardware integration

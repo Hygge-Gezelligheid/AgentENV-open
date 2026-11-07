@@ -64,6 +64,10 @@ def main():
         last = saves[-1]
         measurements['repository_bytes'] = [last['repository']['logical_bytes']]
         measurements['state_growth_bytes'] = [last['state']['allocated_bytes']-last['input_state']['allocated_bytes']]
+        if 'retained_referenced_layers' in rows[-1]:
+            measurements['retained_referenced_layers_bytes'] = [rows[-1]['retained_referenced_layers']['logical_bytes']]
+            measurements['retained_referenced_layer_growth_bytes'] = [
+                rows[-1]['retained_referenced_layers']['logical_bytes'] - rows[-1]['input_referenced_layers']['logical_bytes']]
         pair[first['variant']] = measurements
     planned = {(int(memory), scenario, int(generations))
         for memory, scenario, generations in (case.split(':') for case in protocol['cases'])}

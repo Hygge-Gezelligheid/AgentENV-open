@@ -69,8 +69,8 @@ def main():
     seeds = build_seed(root, batch / 'seed-repository')
     script_dir = Path(__file__).resolve().parent
     binaries = {variant: root / 'bin' / variant / 'server' for variant in ('baseline', 'candidate')}
-    common = dict(daemon=root/'bin/uvm-ublk-daemon',
-        firecracker=root/'runtime-target/x86_64-unknown-linux-musl/release/firecracker',
+    daemons = {variant: root / 'bin' / variant / 'uvm-ublk-daemon' for variant in binaries}
+    common = dict(firecracker=root/'runtime-target/x86_64-unknown-linux-musl/release/firecracker',
         kernel=root/'hardware/deps/kernel/vmlinux-6.18/vmlinux.bin')
     rng = random.Random(20261107)
     order = []
@@ -84,7 +84,8 @@ def main():
                     generations=int(generations), pair=pair, variant=variant))
     protocol = dict(random_seed=20261107, pairs=args.pairs, cases=args.cases, order=order,
         executables={key: dict(path=str(path), sha256=digest(path))
-            for key, path in {**binaries, **common}.items()},
+            for key, path in {**binaries, **{key + '_daemon': path for key, path in daemons.items()},
+                **common}.items()},
         drivers={path.name: digest(path) for path in (
             script_dir/'run_clear_comparison.py', script_dir/'clear_api_trial.py', script_dir/'guest_process_rpc.py')},
         tools_input=dict(path=str(root/'hardware/deps/tools/0.1.1/tools.ext4'),
@@ -126,7 +127,7 @@ enabled = false
 host_interaction_cidr = "10.244.0.0/16"
 veth_cidr = "10.245.0.0/16"
 [ublk]
-daemon_binary_path = "{common['daemon']}"
+daemon_binary_path = "{daemons[cell['variant']]}"
 daemon_metrics_listen_addr = ""
 [pool.network]
 enabled = false

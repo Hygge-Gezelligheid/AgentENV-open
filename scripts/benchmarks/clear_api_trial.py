@@ -35,6 +35,27 @@ def tree_space(root, extra=()):
     return dict(files=files, logical_bytes=logical, allocated_bytes=allocated)
 
 
+
+def referenced_layer_space(repository):
+    digests = set()
+    def visit(value):
+        if isinstance(value, dict):
+            digest = value.get('digest', '')
+            if isinstance(digest, str) and digest.startswith('sha256:'):
+                digests.add(digest)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+    for path in (repository/'catalog/records').glob('*.json'):
+        visit(json.loads(path.read_text())['committed'])
+    stats = [(repository/'managed-layers'/(digest.replace(':', '_')+'.overlaybd.commit')).stat()
+        for digest in digests]
+    return dict(files=len(stats), logical_bytes=sum(stat.st_size for stat in stats),
+        allocated_bytes=sum(stat.st_blocks * 512 for stat in stats))
+
+
 def pause_window(path):
     pause = None
     windows = []
@@ -155,6 +176,7 @@ def main():
             output.flush()
         try:
             initial = tree_space(args.state_root, (args.runtime_root, args.serial_dir))
+            input_referenced_layers = referenced_layer_space(args.repository_root)
             source = create(args.template)
             # A bounded tmpfs payload makes writes guest-memory updates; the
             # mounted volume and workload are identical in each paired run.
@@ -217,6 +239,8 @@ def main():
                 raise RuntimeError('Deleting earlier snapshots invalidated latest snapshot')
             delete(restored)
             record(dict(kind='complete', retained_repository=tree_space(args.repository_root),
+                input_referenced_layers=input_referenced_layers,
+                retained_referenced_layers=referenced_layer_space(args.repository_root),
                 retained_state=tree_space(args.state_root, (args.runtime_root, args.serial_dir))))
         finally:
             for sandbox in list(live):
