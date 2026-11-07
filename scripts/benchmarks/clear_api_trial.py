@@ -182,8 +182,8 @@ def main():
             # mounted volume and workload are identical in each paired run.
             payload = (args.memory_mib * 1024 * 1024 // 2) // 4096 * 4096
             chunk = max(4096, (args.memory_mib * 1024 * 1024 // 100) // 4096 * 4096)
-            guest(source, f'mkdir -p /mnt/clear-bench; mount -t tmpfs -o size={payload + 1048576} '
-                f'tmpfs /mnt/clear-bench; truncate -s {payload} /mnt/clear-bench/payload')
+            guest(source, f'mkdir -p /mnt/clear-bench && mount -t tmpfs -o size={payload + 1048576} '
+                f'tmpfs /mnt/clear-bench && truncate -s {payload} /mnt/clear-bench/payload')
             for generation in range(args.generations):
                 if args.scenario != 'idle':
                     length = payload if args.scenario == 'dense' else chunk
