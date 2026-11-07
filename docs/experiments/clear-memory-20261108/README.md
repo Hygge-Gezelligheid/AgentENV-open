@@ -1,6 +1,6 @@
 # CLEAR memory baseline experiment
 
-Status on 2026-11-08: correctness checks pass; the original performance acceptance is **not yet established**. The current reader improves measured cold restore performance, but both the completed 30-pair study and the independent 120-pair idle confirmation fail warm confidence gates. The remaining confirmation cells are running. Keep this review in draft.
+Status on 2026-11-08: correctness checks pass; the original performance acceptance is **not yet established**. All four independent 512 MiB confirmation cells completed and passed primary space reduction, but each fails one or more original latency gates. The two 4 GiB cells and the 96-generation cell are pending. Keep this review in draft.
 
 ## Implementation
 
@@ -14,6 +14,8 @@ The read changes are confined to OverlayBD:
 - Buffered contextual reads first try `preadv2(RWF_NOWAIT)`. A complete cache hit returns immediately. Misses, partial reads, EOF and errors use the original full-range asynchronous read. Unsupported operation is remembered per open file. This adds roughly thirty production lines, one atomic flag and a focused real io-uring regression; no data cache, extra copy buffer or configuration.
 
 The code audit also removed repeated disk-layer adoption and repeated parent hashing. Rootfs/drive sealed files have one live owner; captures obtain independent links or sparse copies. An index-rewrite prototype, coalescing prototype and 4 KiB-only NOWAIT alternative were measured and removed because they did not improve the relevant end-to-end behavior.
+
+The five handwritten runtime files have a net increase of 180 lines before their independent `cfg(test)` modules: client +27, snapshot helpers +32, sandbox lifecycle +100, LocalFile +31 and mapped reads -10. Counts include comments and blank lines. The baseline ownership and failure state belong to the capture lifecycle; the reader changes stay in OverlayBD.
 
 ## Fixed programs and environment
 
@@ -84,6 +86,27 @@ The predeclared larger idle cell completed all 120 pairs (240 trials), with all 
 
 Allocated growth mean ratio: 0.460 (upper 0.478); repository logical-byte ratio: 0.834 (upper 0.841). The retention boundary below still applies.
 
+## Independent 60-pair rotating and hotspot confirmations
+
+Both cells completed all 60 pairs (120 trials each), with all payload/deletion checks passing and primary space reduced. Every targeted-cold latency gate passed. Warm readiness still fails in both cells; hotspot also fails warm first-read tail and combined gates. Unlike the idle result, the hotspot warm-ready point estimate itself exceeds the 5% margin. No samples or gates were changed after seeing these results.
+
+| Cell / endpoint | p50 ratio (upper) | p95 ratio (upper) | Original gate |
+| --- | ---: | ---: | --- |
+| Rotating: warm ready | 1.032 (1.062) | 1.076 (1.140) | Fail |
+| Rotating: warm first full read | 0.963 (1.008) | 0.914 (1.001) | Pass |
+| Rotating: warm ready + read | 0.983 (1.015) | 0.976 (1.041) | Pass |
+| Hotspot: warm ready | 1.060 (1.086) | 1.028 (1.112) | Fail |
+| Hotspot: warm first full read | 0.994 (1.036) | 1.080 (1.142) | Fail |
+| Hotspot: warm ready + read | 1.020 (1.052) | 1.058 (1.137) | Fail |
+
+Allocated growth mean ratios are 0.416 (upper 0.429) for rotating and 0.553 (upper 0.574) for hotspot. Repository logical-byte mean ratios are 0.718 (upper 0.726) and 0.832 (upper 0.842). These are retained-history results, with the same retention boundary below.
+
+## Independent 30-pair dense confirmation
+
+The 512 MiB dense cell completed all 30 pairs with payload/deletion checks passing. Primary allocated growth fell by about 8%: mean ratio 0.921 (upper 0.926). Repository logical-byte mean ratio was 0.932 (upper 0.937). Warm readiness failed with p50 1.064 (upper 1.094) and p95 1.135 (upper 1.209). Targeted-cold first-read p50 also failed its confidence gate: 1.021 (upper 1.099). Every other latency gate passed, including warm combined p50 0.996 (upper 1.029) and cold combined p50 0.990 (upper 1.023).
+
+Latest-only retention remains a material boundary: after old-record deletion this dense cell references 3.657 times the original total managed-layer bytes including seeds, or 7.147 times the additional referenced bytes above seeds. Whole-history storage improvement does not establish latest-only storage improvement. The two 4 GiB cells and the 96-generation cell remain pending.
+
 ## Space and retention boundary
 
 Space counts repository logical bytes and allocated node/work/serial bytes, deduplicating hard links by device/inode. Growth subtracts seeded input state and includes the running source's private baseline. Common binaries and fixed dependency images are excluded. The measured filesystem is ext4. The separate transient control runtime directories contained no regular files in the completed batch; writable device data lives under the counted work directories.
@@ -113,6 +136,8 @@ The current reader was then measured in 12 randomized pairs on the same equivale
 | Targeted-cold ready + first full read | 664.16 | 653.00 | 1.017 |
 
 This control shows a much smaller layout cost after the reader fixes. It does not prove the whole capture/restore lifecycle meets the confidence gates. On a separate fixed nine-layer idle artifact, unrestricted NOWAIT reduced warm readiness by 12.1% and cold combined latency by 6.9% versus the preceding committed reader (12 randomized blocks/reader). The 4 KiB-only variant had no additional benefit and was removed.
+
+A subsequent one-pair diagnostic used `strace -f -c --seccomp-bpf`, filtering `read`, `readv`, `pread64`, `preadv2`, `io_uring_enter` and `io_uring_setup`, around each API server and its descendants. On byte-identical nine-layer/flattened inputs, aggregate `preadv2` counts were 15278/13189 and `io_uring_enter` counts were 6902/4372; both layouts passed checksums. This includes startup, untimed warm-up, warm and cold restores and repeated full checksums. It shows additional read/submission calls can occur with unchanged logical bytes, but tracing perturbs execution and guest background activity. Its times are excluded from acceptance; one traced pair cannot quantify the ordinary latency penalty. The diagnostic ran between completed formal cells and left no owned processes before the original coordinator resumed.
 
 An additional 33-layer control had mixed results: first restore in a fresh API process had warm combined +14.2% and cold combined -14.3%; after an untimed restore plus complete checksum before each timed warm restore, warm combined was -2.1% and cold combined -1.8%. Both cache definitions and negative outcomes were preserved. These results motivated fresh-chain confirmation rather than a claim based on one favorable microbenchmark.
 
@@ -150,6 +175,7 @@ The preceding `9b99228` formal2 candidate completed 30 pairs each for idle, rota
 [evidence.json](evidence.json) indexes deterministic compressed JSON by SHA-256. The formal reports include all numeric measurements grouped by independent paired trial. Absolute task paths are normalized; numeric data is unchanged. No API keys, node secrets, VM memory files or catalogs are included.
 
 - [Independent 120-pair idle confirmation and raw paired measurements](formal4-idle.json.gz)
+- Independent [60-pair rotating](formal4-rotating.json.gz), [60-pair hotspot](formal4-hotspot.json.gz) and [30-pair dense](formal4-dense.json.gz) confirmations with raw paired measurements
 - [Earlier current-code 30-pair idle report](formal3-idle.json.gz)
 - [Earlier idle](formal2-idle.json.gz), [rotating](formal2-rotating.json.gz), [hotspot](formal2-hotspot.json.gz)
 - [Identical-byte layout control](equivalent-layout.json.gz)

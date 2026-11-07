@@ -1,7 +1,7 @@
 {
   "baseline": "05323abea960ab9348208d774c320d3782651544",
   "candidate_code": "367b29fcf989fa7a0ffcc65564451f7be6b280a1",
-  "status": "Functional checks passed; 120-pair idle confirmation still fails warm confidence gates. Remaining independent confirmation cells are running.",
+  "status": "Functional checks passed; all four completed confirmation cells fail one or more original latency gates and pass primary space reduction. Two 4 GiB cells and the 96-generation cell are pending.",
   "numeric_data": "Measurements are unchanged; task-local absolute paths are normalized. Compressed JSON includes paired raw measurements.",
   "files": {
     "formal3-idle.json.gz": {
@@ -51,6 +51,18 @@
     "baseline-blocked-tasks.json": {
       "sha256": "cd3691ee55d88ea97df473bf41576ef0d10158ad1beb9ce2c14d9bdead202340",
       "bytes": 2227
+    },
+    "formal4-rotating.json.gz": {
+      "sha256": "99f9baab6ae47523341c3c99b07613ce5d018199397913d19df0b63810b3d478",
+      "bytes": 33018
+    },
+    "formal4-hotspot.json.gz": {
+      "sha256": "5ce42caa7fb88e2c47f3a5a8f1649cce5d8c61361bbcee5d01dd178dde6ed211",
+      "bytes": 32758
+    },
+    "formal4-dense.json.gz": {
+      "sha256": "dc62212dca399324f3d4ce531465d66f0bba1213f3288e2f0589cd4da414de0f",
+      "bytes": 18603
     }
   }
 }
