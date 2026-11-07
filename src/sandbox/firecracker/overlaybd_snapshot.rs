@@ -12,7 +12,6 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -193,22 +192,6 @@ async fn link_or_copy_runtime_layer(source: &Path, destination: &Path) -> Result
         .with_context(|| description)
 }
 
-async fn prepare_specific_snapshot_layer_path(snapshot_layer_path: &Path) -> Result<()> {
-    match tokio::fs::remove_file(&snapshot_layer_path).await {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "remove stale overlaybd snapshot layer {}",
-                    snapshot_layer_path.display()
-                )
-            })
-        }
-    }
-    Ok(())
-}
-
 fn load_existing_image_config(
     image_config_path: Option<&Path>,
     description: &str,
@@ -244,14 +227,6 @@ fn restack_target_upper_data_path(live_runtime_image_config_path: &Path) -> Resu
     Ok(PathBuf::from(image_config.upper.data))
 }
 
-fn on_same_filesystem(src_path: &Path, dst_dir: &Path) -> Result<bool> {
-    let src_meta = fs::metadata(src_path)
-        .with_context(|| format!("stat restack source path {}", src_path.display()))?;
-    let dst_meta = fs::metadata(dst_dir)
-        .with_context(|| format!("stat restack destination dir {}", dst_dir.display()))?;
-    Ok(src_meta.dev() == dst_meta.dev())
-}
-
 fn write_bytes_atomically(path: &Path, bytes: &[u8], description: &str) -> Result<()> {
     let parent = path.parent().with_context(|| {
         format!(
@@ -272,37 +247,6 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8], description: &str) -> Resul
             "persist {description} {} -> {}",
             temp_path.display(),
             path.display()
-        ))
-    })?;
-    Ok(())
-}
-
-async fn copy_file_atomically(src: &Path, dst: &Path, description: &str) -> Result<()> {
-    let parent = dst.parent().with_context(|| {
-        format!(
-            "{description} destination has no parent directory: {}",
-            dst.display()
-        )
-    })?;
-    let temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temp {description} in {}", parent.display()))?;
-    let temp_path = temp.path().to_path_buf();
-    tokio::fs::copy(src, &temp_path).await.with_context(|| {
-        format!(
-            "copy {description} {} -> {}",
-            src.display(),
-            temp_path.display()
-        )
-    })?;
-    std::fs::File::open(&temp_path)
-        .with_context(|| format!("open temp {description} {}", temp_path.display()))?
-        .sync_all()
-        .with_context(|| format!("sync temp {description} {}", temp_path.display()))?;
-    temp.persist(dst).map_err(|error| {
-        anyhow::Error::new(error.error).context(format!(
-            "persist {description} {} -> {}",
-            temp_path.display(),
-            dst.display()
         ))
     })?;
     Ok(())
@@ -493,13 +437,12 @@ async fn capture_live_overlaybd_snapshot(
     ublk_device: &UblkDevice,
     read_only: bool,
     live_runtime_image_config_path: &Path,
-    output_dir: &Path,
     snapshot_layer_file_name: &str,
     kind: &'static str,
 ) -> Result<LiveOverlaybdSnapshotState> {
     if read_only {
         debug!(
-            output_dir = %output_dir.display(),
+            image_config = %live_runtime_image_config_path.display(),
             "staging overlaybd snapshot from read-only runtime config"
         );
         return Ok(LiveOverlaybdSnapshotState::ReadOnly);
@@ -507,8 +450,6 @@ async fn capture_live_overlaybd_snapshot(
 
     let live_upper_data_path = restack_target_upper_data_path(live_runtime_image_config_path)
         .context("resolve restack source upper path")?;
-    let snapshot_layer_path = output_dir.join(snapshot_layer_file_name);
-    prepare_specific_snapshot_layer_path(&snapshot_layer_path).await?;
     // The live device must retain its own immutable lowers even when a
     // caller discards a capture directory or publication fails.
     let sealed_dir = live_upper_data_path
@@ -524,47 +465,25 @@ async fn capture_live_overlaybd_snapshot(
         .await
         .context("request overlaybd restack snapshot from ublk device")?;
 
-    if live_snapshot_layer_path != snapshot_layer_path {
-        // If this cross-filesystem copy fails, leave the live runtime config
-        // untouched and surface a terminal pause failure. The daemon has
-        // already sealed the old upper and reopened a fresh one, so callers
-        // must not continue treating the live runtime as safely resumable.
-        if on_same_filesystem(&live_snapshot_layer_path, output_dir)
-            .map_err(into_terminal_snapshot_failure)?
-        {
-            link_or_copy_runtime_layer(&live_snapshot_layer_path, &snapshot_layer_path)
-                .await
-                .map_err(into_terminal_snapshot_failure)?;
-        } else {
-            copy_file_atomically(
-                &live_snapshot_layer_path,
-                &snapshot_layer_path,
-                "restack snapshot layer",
-            )
-            .await
-            .map_err(into_terminal_snapshot_failure)?;
-        }
-    }
-
     if let Some(descriptor) = descriptor.as_ref() {
-        let copied_size = tokio::fs::metadata(&snapshot_layer_path)
+        let sealed_size = tokio::fs::metadata(&live_snapshot_layer_path)
             .await
             .with_context(|| {
                 format!(
                     "read restack snapshot layer metadata {}",
-                    snapshot_layer_path.display()
+                    live_snapshot_layer_path.display()
                 )
             })
             .map_err(into_terminal_snapshot_failure)?
             .len();
-        if copied_size != descriptor.size {
+        if sealed_size != descriptor.size {
             // Keep the sealed layer: the live device may still reference it,
             // and terminal deletion marks the volume failed for recovery.
             return Err(into_terminal_snapshot_failure(anyhow::anyhow!(
                 "restack snapshot descriptor size mismatch for {}: descriptor says {}, file has {}",
-                snapshot_layer_path.display(),
+                live_snapshot_layer_path.display(),
                 descriptor.size,
-                copied_size
+                sealed_size
             )));
         }
     }
@@ -730,7 +649,6 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         ublk_device,
         read_only,
         live_runtime_image_config_path,
-        output_dir,
         snapshot_layer_file_name,
         kind,
     )
@@ -1449,9 +1367,33 @@ mod tests {
 
     #[tokio::test]
     async fn stage_live_runtime_owns_sealed_layers_after_previous_capture_deletion() {
+        assert_staged_disk_layers_owned(tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires /dev/shm on a separate filesystem"]
+    async fn stage_live_runtime_owns_cross_filesystem_copies() {
+        let previous = tempfile::Builder::new()
+            .prefix("clear-cross-fs-")
+            .tempdir_in("/dev/shm")
+            .unwrap();
+        let next = tempfile::Builder::new()
+            .prefix("clear-cross-fs-")
+            .tempdir_in("/dev/shm")
+            .unwrap();
+        assert_staged_disk_layers_owned(previous, next).await;
+    }
+
+    async fn assert_staged_disk_layers_owned(previous: tempfile::TempDir, next: tempfile::TempDir) {
         let live = tempfile::tempdir().unwrap();
-        let previous = tempfile::tempdir().unwrap();
-        let next = tempfile::tempdir().unwrap();
+        if previous.path().starts_with("/dev/shm") {
+            assert_ne!(
+                fs::metadata(live.path()).unwrap().dev(),
+                fs::metadata(previous.path()).unwrap().dev(),
+                "the explicit cross-filesystem test must exercise the copy fallback"
+            );
+        }
         let layer = live.path().join("sealed.commit");
         fs::write(&layer, b"first generation disk").unwrap();
         let config = live.path().join("image.json");
