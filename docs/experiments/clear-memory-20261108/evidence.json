@@ -67,6 +67,10 @@
     "reader-controls-arm.json.gz": {
       "sha256": "61ede571523d98f7c4983e17b3870764584f5a1bd63a446600ffbbaf13c208bf",
       "bytes": 44230
+    },
+    "reader-geometry-arm.json.gz": {
+      "sha256": "17c84eb62abd4002a18c2ad1ca24144c2a4ef7dc3ab169b22a45a50bd8a32c6f",
+      "bytes": 38460
     }
   }
 }

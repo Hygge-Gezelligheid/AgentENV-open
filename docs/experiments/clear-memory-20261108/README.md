@@ -160,6 +160,21 @@ Both candidates were removed; runtime code remains `367b29f`. These ARM attribut
 
 Separate CPU counters on eight fresh nodes compared first/second restores after priming the base VM and warming input memory files. Median daemon CPU time was 76.05/78.32 ms, context switches 244/213.5 and page faults 199/99. These aggregate counters do not identify the remaining source of readiness latency. Sampling interrupts were unavailable on this ARM host; only non-sampling counters are reported. Instrumented wall times are excluded from acceptance. All ten affected ARM Rust files were verified restored, with no diagnostic API, daemon or recorder processes left.
 
+## Observed request geometry and small-read attribution
+
+Three fresh ARM nodes restored the fixed nine-layer rotating snapshot and passed full payload checksums. A diagnostic daemon only added queue thread names to existing JSON request logs. Request selection followed the owned Firecracker process ancestry and its memory block device; rootfs/tool requests were excluded. Logging perturbs execution, so these observations make no latency claim.
+
+| Phase, all three nodes | Requests | Nonzero mapped fragments | Same-file physically contiguous groups | Requests over 32 fragments |
+| --- | ---: | ---: | ---: | ---: |
+| Restore readiness | 1448 | 6625 | 5011 | 15 |
+| First full checksum | 334 | 601 | 484 | 0 |
+
+Most requests were 256 KiB: about 74% during readiness and 88% during the first checksum. Grouping could theoretically reduce fragment read submissions by 24.4%/19.5%, without reading extra bytes, if a suitable vectored interface existed. These are potential submission counts, not a measured speedup. The existing reader has no such interface; no new interface or concurrency-limit change was retained on this evidence.
+
+A separate cached-metadata probe compared 512-byte reads with direct NOWAIT calls, using 50 paired observations per file count and a fresh Tokio runtime each time. For nine files, original/direct-call medians were 0.363/0.015 ms; for 33 files, 0.821/0.048 ms. This includes first blocking-pool expansion, unlike the preceding warm sequential probe. All bytes matched. The small absolute difference on this host does not explain the Intel readiness regression, and no extra owned-read fast path was added.
+
+[Complete numeric data and sources](reader-geometry-arm.json.gz) include synthetic logical/physical mapping numbers, every observed request, static grouping counts, kernel block totals, all 400 metadata observations, program hashes and an independent verifier. That verifier reproduced every observed/static grouping count from the exported mappings. The failed initial VM-identification probe and failed first metadata-probe compilation are recorded separately from valid measurements. All ten affected runtime Rust files and the logging source were restored; no diagnostic API, daemon or recorder remained. Runtime code is still `367b29f`.
+
 ## Correctness and actual coverage
 
 | Check | Intel | ARM |
@@ -203,6 +218,7 @@ The preceding `9b99228` formal2 candidate completed 30 pairs each for idle, rota
 - [Preserved interrupted dense cell](formal2-dense-interrupted.json.gz)
 - [Long-chain first-restore reader control](reader-long.json.gz) and [explicitly prewarmed control](reader-long-prewarmed.json.gz)
 - [Additional ARM reader controls, candidate patches and harness sources](reader-controls-arm.json.gz)
+- [Observed ARM request geometry, synthetic mappings and metadata attribution](reader-geometry-arm.json.gz)
 
 Follow [the benchmark preparation guide](../../../scripts/benchmarks/README.md) to regenerate fresh seeds and trials. Run each case independently with its fixed pair count. Preserve every protocol and failed/incomplete sample. Exact current runtime hashes are above.
 
@@ -239,5 +255,23 @@ for metric, saved in study['statistics']['metrics'].items():
             assert math.isclose(recalculated[statistic][field], saved[statistic][field],
                                 rel_tol=1e-12, abs_tol=1e-12)
 print('ARM diagnostic ratios reproduced')
+PYCODE
+```
+
+To independently reproduce request grouping without VM memory files, unpack the synthetic numeric input and saved verifier into a temporary directory:
+
+```bash
+python3 - <<'PYCODE'
+import gzip, json, pathlib, subprocess, sys, tempfile
+bundle = json.load(gzip.open('docs/experiments/clear-memory-20261108/reader-geometry-arm.json.gz', 'rt'))
+with tempfile.TemporaryDirectory() as directory:
+    root = pathlib.Path(directory)
+    (root / 'tools').mkdir()
+    for key, name in [('observed_with_layout', 'read-groups-observed-with-layout.json'),
+                      ('requests', 'requests.json'), ('static', 'read-groups-static.json')]:
+        (root / name).write_text(json.dumps(bundle['data'][key]))
+    verifier = root / 'tools/verify-read-geometry.py'
+    verifier.write_text(bundle['sources']['verify-read-geometry.py'])
+    subprocess.run([sys.executable, str(verifier)], check=True)
 PYCODE
 ```
