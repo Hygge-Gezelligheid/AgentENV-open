@@ -63,6 +63,10 @@
     "formal4-dense.json.gz": {
       "sha256": "dc62212dca399324f3d4ce531465d66f0bba1213f3288e2f0589cd4da414de0f",
       "bytes": 18603
+    },
+    "reader-controls-arm.json.gz": {
+      "sha256": "61ede571523d98f7c4983e17b3870764584f5a1bd63a446600ffbbaf13c208bf",
+      "bytes": 44230
     }
   }
 }

@@ -1,6 +1,6 @@
 # CLEAR memory baseline experiment
 
-Status on 2026-11-08: correctness checks pass; the original performance acceptance is **not yet established**. All four independent 512 MiB confirmation cells completed and passed primary space reduction, but each fails one or more original latency gates. The two 4 GiB cells and the 96-generation cell are pending. Keep this review in draft.
+Status on 2026-11-08: correctness checks pass; the original performance acceptance is **not yet established**. All four independent 512 MiB confirmation cells completed and passed primary space reduction, but each fails one or more original latency gates. Results for the two 4 GiB cells and the 96-generation cell remain to be collected and verified. Keep this review in draft.
 
 ## Implementation
 
@@ -69,7 +69,7 @@ All point estimates meet the margins; several confidence bounds do not. This est
 
 ## Independent 120-pair idle confirmation
 
-The predeclared larger idle cell completed all 120 pairs (240 trials), with all payload/deletion checks passing. Save/pause, every targeted-cold latency endpoint and primary space reduction passed. Three warm endpoints still fail their confidence gates. All point estimates remain inside the margins; this is not full acceptance. No additional replicas are being added to this cell after inspecting this result. The other six independent cells continue at their previously fixed counts.
+The predeclared larger idle cell completed all 120 pairs (240 trials), with all payload/deletion checks passing. Save/pause, every targeted-cold latency endpoint and primary space reduction passed. Three warm endpoints still fail their confidence gates. All point estimates remain inside the margins; this is not full acceptance. No additional replicas are being added to this cell after inspecting this result. Other cells retain their previously fixed counts; completed results are reported below.
 
 | Endpoint | p50 ratio (upper) | p95 ratio (upper) | Original gate |
 | --- | ---: | ---: | --- |
@@ -141,6 +141,25 @@ A subsequent one-pair diagnostic used `strace -f -c --seccomp-bpf`, filtering `r
 
 An additional 33-layer control had mixed results: first restore in a fresh API process had warm combined +14.2% and cold combined -14.3%; after an untimed restore plus complete checksum before each timed warm restore, warm combined was -2.1% and cold combined -1.8%. Both cache definitions and negative outcomes were preserved. These results motivated fresh-chain confirmation rather than a claim based on one favorable microbenchmark.
 
+## Additional ARM reader controls
+
+Two further candidates were measured and removed. Replacing the result array with an asynchronous fold reduced code by three lines but made cached fragmented reads about 2–6% slower in the clean microbenchmark. Using `join_all` for groups of at most 32 fragments added three lines and improved 64 KiB/16-fragment reads by about 17–18%. Single-mapping and larger-group controls stayed close to the existing reader. Each variant used four interleaved processes, each with 30 blocks of 128 reads per case; all byte checks passed. An earlier fold sequence overlapped test compilation and is preserved separately as exploratory data.
+
+The small-group candidate then passed 408 OverlayBD library tests (four ignored), formatting of the changed file, package/all-target/all-feature Clippy, and native ARM checks using matching rebuilt programs: five CLEAR integrations including 96 captures/restores, encoded pause, lifecycle, attached drives and the two complete 512 MiB/4 GiB memory oracles. Those checks establish correctness, not a speed improvement.
+
+A fixed rotating-eight-generation snapshot was compared in 12 randomized pairs using an identical **debug API server** and old/new **release daemons**, with a complete untimed restore/checksum before warm measurements and targeted file eviction before cold measurements. Every checksum passed, but no restoration gain was demonstrated:
+
+| Small-group candidate / existing reader | Median ratio | One-sided 95% upper |
+| --- | ---: | ---: |
+| Warm ready | 1.022 | 1.080 |
+| Warm ready + full read | 1.012 | 1.049 |
+| Targeted-cold ready | 1.053 | 1.075 |
+| Targeted-cold ready + full read | 1.035 | 1.054 |
+
+Both candidates were removed; runtime code remains `367b29f`. These ARM attribution trials do not replace the original seven-cell upstream comparison or establish its noninferiority gates. [Raw controls](reader-controls-arm.json.gz) include both clean and confounded microbenchmarks, candidate patches, diagnostic harness sources, program hashes, the 12 paired restore observations and their bootstrap seed/iterations.
+
+Separate CPU counters on eight fresh nodes compared first/second restores after priming the base VM and warming input memory files. Median daemon CPU time was 76.05/78.32 ms, context switches 244/213.5 and page faults 199/99. These aggregate counters do not identify the remaining source of readiness latency. Sampling interrupts were unavailable on this ARM host; only non-sampling counters are reported. Instrumented wall times are excluded from acceptance. All ten affected ARM Rust files were verified restored, with no diagnostic API, daemon or recorder processes left.
+
 ## Correctness and actual coverage
 
 | Check | Intel | ARM |
@@ -183,6 +202,7 @@ The preceding `9b99228` formal2 candidate completed 30 pairs each for idle, rota
 - [Completed formal3 protocol](formal3-protocol.json) and [fixed larger confirmation protocol](confirmation-protocol.json)
 - [Preserved interrupted dense cell](formal2-dense-interrupted.json.gz)
 - [Long-chain first-restore reader control](reader-long.json.gz) and [explicitly prewarmed control](reader-long-prewarmed.json.gz)
+- [Additional ARM reader controls, candidate patches and harness sources](reader-controls-arm.json.gz)
 
 Follow [the benchmark preparation guide](../../../scripts/benchmarks/README.md) to regenerate fresh seeds and trials. Run each case independently with its fixed pair count. Preserve every protocol and failed/incomplete sample. Exact current runtime hashes are above.
 
@@ -205,5 +225,19 @@ for index, workload in enumerate(report['workloads']):
                 assert math.isclose(recalculated[statistic][field], saved[statistic][field],
                                     rel_tol=1e-12, abs_tol=1e-12)
 print('Paired ratios reproduced')
+
+controls = json.load(gzip.open('docs/experiments/clear-memory-20261108/reader-controls-arm.json.gz', 'rt'))
+study = controls['restore_join']
+paired = {reader: {row['block']: row for row in study['measurements'] if row['reader'] == reader}
+          for reader in ('original', 'join')}
+for metric, saved in study['statistics']['metrics'].items():
+    recalculated = ratios([([paired['original'][i][metric]], [paired['join'][i][metric]])
+                           for i in range(study['protocol']['pairs'])],
+                          study['bootstrap_iterations'], study['bootstrap_seed'])
+    for statistic in ('p50', 'p95', 'mean'):
+        for field in ('ratio', 'upper_95_one_sided'):
+            assert math.isclose(recalculated[statistic][field], saved[statistic][field],
+                                rel_tol=1e-12, abs_tol=1e-12)
+print('ARM diagnostic ratios reproduced')
 PYCODE
 ```
