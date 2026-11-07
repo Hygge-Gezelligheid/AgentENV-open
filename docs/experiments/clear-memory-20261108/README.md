@@ -1,6 +1,6 @@
 # CLEAR memory baseline experiment
 
-Status on 2026-11-08: correctness checks pass; the original performance acceptance is **not yet established**. The current reader improves measured cold restore performance, but the completed 30-pair idle cell fails several confidence gates. A larger independent confirmation is running. Keep this review in draft.
+Status on 2026-11-08: correctness checks pass; the original performance acceptance is **not yet established**. The current reader improves measured cold restore performance, but both the completed 30-pair study and the independent 120-pair idle confirmation fail warm confidence gates. The remaining confirmation cells are running. Keep this review in draft.
 
 ## Implementation
 
@@ -46,7 +46,7 @@ Targeted-cold mode flushes and evicts experiment snapshot data files and verifie
 
 The larger independent confirmation fixes pair counts at **120/60/60/30/30/30/30** in the cell order above. Short-latency cells get more samples because the preceding 30-pair study left wide tail confidence bounds. Previous failures remain separate; there is no selective exclusion or pooling. The confirmation uses default CPU/NUMA placement. A separate five-pair affinity experiment did not eliminate warm-read variation and is not used to replace the primary measurements.
 
-## Current completed 30-pair idle result
+## Earlier current-code 30-pair idle result
 
 Candidate/original ratios below show point estimate followed by the one-sided 95% upper bound. This is the complete `367b29f` formal3 idle cell, not the pending larger confirmation.
 
@@ -65,7 +65,26 @@ Candidate/original ratios below show point estimate followed by the one-sided 95
 
 All point estimates meet the margins; several confidence bounds do not. This establishes neither full noninferiority nor a failure-free full workload matrix. The other six formal3 cells were not run after this failure.
 
-### Space and retention boundary
+## Independent 120-pair idle confirmation
+
+The predeclared larger idle cell completed all 120 pairs (240 trials), with all payload/deletion checks passing. Save/pause, every targeted-cold latency endpoint and primary space reduction passed. Three warm endpoints still fail their confidence gates. All point estimates remain inside the margins; this is not full acceptance. No additional replicas are being added to this cell after inspecting this result. The other six independent cells continue at their previously fixed counts.
+
+| Endpoint | p50 ratio (upper) | p95 ratio (upper) | Original gate |
+| --- | ---: | ---: | --- |
+| Save API | 0.563 (0.609) | 0.478 (0.493) | Pass |
+| Pause upper bound | 0.793 (0.827) | 0.823 (0.838) | Pass |
+| Whole-chain save total | 0.508 (0.528) | 0.496 (0.505) | Pass |
+| Whole-chain pause total | 0.791 (0.806) | 0.804 (0.813) | Pass |
+| Warm restore ready | 1.036 (1.055) | 1.073 (1.108) | Fail |
+| Warm first full read | 1.037 (1.098) | 1.016 (1.087) | Fail |
+| Warm ready + read | 1.046 (1.065) | 1.056 (1.092) | Fail |
+| Targeted-cold restore ready | 0.815 (0.837) | 0.797 (0.845) | Pass |
+| Targeted-cold first full read | 0.982 (1.047) | 0.982 (1.035) | Pass |
+| Targeted-cold ready + read | 0.889 (0.910) | 0.915 (0.926) | Pass |
+
+Allocated growth mean ratio: 0.460 (upper 0.478); repository logical-byte ratio: 0.834 (upper 0.841). The retention boundary below still applies.
+
+## Space and retention boundary
 
 Space counts repository logical bytes and allocated node/work/serial bytes, deduplicating hard links by device/inode. Growth subtracts seeded input state and includes the running source's private baseline. Common binaries and fixed dependency images are excluded. The measured filesystem is ext4. The separate transient control runtime directories contained no regular files in the completed batch; writable device data lives under the counted work directories.
 
@@ -120,7 +139,7 @@ The full aggregate unit/integration targets and Go suites were not rerun. Valida
 
 ## Retained negative and incomplete evidence
 
-The first formal batch stopped on a reproducible original-baseline process/file-read hang. Its completed 30-pair idle cell, before the parallel read fix, had cold readiness +25.7% and cold combined +14.1%. Repeated restore probes stalled, including after a byte-equivalent flattening. Some guest endpoints remained live. Root cause is unresolved; the artifact is retained privately, not included with public measurement data.
+The first formal batch stopped on a reproducible original-baseline process/file-read hang. Its completed 30-pair idle cell, before the parallel read fix, had cold readiness +25.7% and cold combined +14.1%. Repeated restore probes stalled, including after a byte-equivalent flattening. Some guest endpoints remained live. Correct `username=root` file requests and an explicitly authenticated root process also timed out. A guest-only SysRq request succeeded and showed `ext4lazyinit`, `envd` and a shell blocked in ext4 buffer/folio I/O waits. [Selected diagnostic frames](baseline-blocked-tasks.json) retain no register or memory dump. A second diagnostic iteration failed in its request wrapper before VM creation; it contributes no product result, and cleanup verified no diagnostic processes remained. The original coordinator resumed unchanged. Root cause remains unresolved; the VM artifact is retained privately, not included with public measurement data.
 
 A test-only original-baseline oracle later compared complete 512 MiB memory for 12 captures, including a restore after the first. All bytes matched. Its workload and intervening full-memory reads differ from the failed trial; this does not fix or explain the bad artifact. Original source was restored after compiling the probe.
 
@@ -128,13 +147,16 @@ The preceding `9b99228` formal2 candidate completed 30 pairs each for idle, rota
 
 ## Evidence and reproduction
 
-[evidence.json](evidence.json) indexes deterministic compressed JSON by SHA-256. The four formal reports include all numeric measurements grouped by independent paired trial. Absolute task paths are normalized; numeric data is unchanged. No API keys, node secrets, VM memory files or catalogs are included.
+[evidence.json](evidence.json) indexes deterministic compressed JSON by SHA-256. The formal reports include all numeric measurements grouped by independent paired trial. Absolute task paths are normalized; numeric data is unchanged. No API keys, node secrets, VM memory files or catalogs are included.
 
-- [Current 30-pair idle report and raw paired measurements](formal3-idle.json.gz)
+- [Independent 120-pair idle confirmation and raw paired measurements](formal4-idle.json.gz)
+- [Earlier current-code 30-pair idle report](formal3-idle.json.gz)
 - [Earlier idle](formal2-idle.json.gz), [rotating](formal2-rotating.json.gz), [hotspot](formal2-hotspot.json.gz)
 - [Identical-byte layout control](equivalent-layout.json.gz)
 - [Three-reader fixed idle control](reader-idle.json.gz)
-- [Completed formal3 protocol](formal3-protocol.json)
+- [Completed formal3 protocol](formal3-protocol.json) and [fixed larger confirmation protocol](confirmation-protocol.json)
+- [Preserved interrupted dense cell](formal2-dense-interrupted.json.gz)
+- [Long-chain first-restore reader control](reader-long.json.gz) and [explicitly prewarmed control](reader-long-prewarmed.json.gz)
 
 Follow [the benchmark preparation guide](../../../scripts/benchmarks/README.md) to regenerate fresh seeds and trials. Run each case independently with its fixed pair count. Preserve every protocol and failed/incomplete sample. Exact current runtime hashes are above.
 
