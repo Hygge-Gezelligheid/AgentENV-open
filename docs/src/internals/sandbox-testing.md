@@ -756,7 +756,9 @@ Each subsequent memory layer contains pages dirtied since the preceding
 successful CLEAR, including explicit zero writes and conservatively dirty
 virtio queue pages. The image config includes the complete parent chain.
 Existing layer-budget compaction can combine historical updates into a new
-layer; stable base layers keep their separate compaction boundary.
+layer; stable base layers keep their separate compaction boundary. OverlayBD
+reads the merged index and overlaps up to 32 independent mapped reads into
+disjoint caller-buffer slices. It drains these reads before returning an error.
 
 GET/CLEAR failures or timeouts can leave partially consumed KVM logs. AgentENV
 classifies these as terminal capture failures and stops the affected instance.
@@ -783,13 +785,13 @@ Use isolated state, runtime, and dependency directories as described above.
 `AENV_CLEAR_TEST_IMAGE_CONFIG` can select a prepared local public image for this
 regression; otherwise it resolves the standard integration-test image.
 
-Additional isolated regressions cover complete guest-memory byte comparison,
-CLEAR response rejection/loss/timeouts, publication failure, fork and encoded
+Additional isolated regressions cover complete 512 MiB and 4 GiB guest-memory
+byte comparison, CLEAR response rejection/loss/timeouts, publication failure, fork and encoded
 pause recovery, and fresh POSIX/OSS repository caches:
 
 ```bash
 scripts/run-with-capabilities.sh cargo test -p agentenv --lib \
-  clear_snapshot_matches_complete_guest_memory -- --ignored --nocapture
+  clear_snapshot_matches_complete -- --ignored --nocapture --test-threads=1
 scripts/run-with-capabilities.sh cargo test -p agentenv --lib \
   clear_failure_or_lost_response_never_resumes_instance -- --ignored --nocapture
 scripts/run-with-capabilities.sh cargo test -p agentenv --test integration \

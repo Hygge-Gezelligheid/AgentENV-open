@@ -2738,7 +2738,7 @@ mod tests {
         )
     }
 
-    async fn clear_test_sandbox() -> Result<FirecrackerSandbox> {
+    async fn clear_test_sandbox(memory_mib: u32) -> Result<FirecrackerSandbox> {
         crate::logging::init_for_tests();
         let config = ConfigManager::init_global()?.config();
         UblkDeviceManager::init_global_from_config(config).await?;
@@ -2751,7 +2751,7 @@ mod tests {
                 runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
             })?;
         config.vcpu_count = 2;
-        config.mem_size_mib = 512;
+        config.mem_size_mib = memory_mib;
         config.common.track_dirty_pages = true;
         let mut sandbox = FirecrackerSandbox::new(config)?;
         sandbox.start().await?;
@@ -2761,9 +2761,19 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated KVM/ublk state and AENV_CLEAR_TEST_IMAGE_CONFIG"]
     async fn clear_snapshot_matches_complete_guest_memory() -> Result<()> {
+        assert_complete_snapshot_memory(512).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated KVM/ublk state and at least 4 GiB available memory"]
+    async fn clear_snapshot_matches_complete_large_guest_memory() -> Result<()> {
+        assert_complete_snapshot_memory(4096).await
+    }
+
+    async fn assert_complete_snapshot_memory(memory_mib: u32) -> Result<()> {
         use super::super::process_vm_reader::ProcessVmReader;
         use overlaybd::{backend::local::LocalFile, virtual_file::VirtualFile};
-        let mut sandbox = clear_test_sandbox().await?;
+        let mut sandbox = clear_test_sandbox(memory_mib).await?;
         let store = tempfile::tempdir()?;
         let result = async {
             for generation in 0..4 {
@@ -2801,7 +2811,7 @@ mod tests {
                         compared += length as u64;
                     }
                 }
-                anyhow::ensure!(compared == 512 * MIB, "incomplete full-memory oracle: {compared}");
+                anyhow::ensure!(compared == u64::from(memory_mib) * MIB, "incomplete full-memory oracle: {compared}");
                 println!("full-memory generation={generation} bytes={compared} PASS");
                 if generation == 1 {
                     sandbox.stop().await?;
@@ -2829,7 +2839,7 @@ mod tests {
         use hyper_util::rt::TokioIo;
         use std::sync::atomic::{AtomicUsize, Ordering};
         for mode in ["rejected", "lost", "timeout"] {
-            let mut sandbox = clear_test_sandbox().await?;
+            let mut sandbox = clear_test_sandbox(512).await?;
             let store = tempfile::tempdir()?;
             let (baseline, _) = sandbox.pause_to_dir(&store.path().join("baseline")).await?;
             sandbox.resume().await?;
