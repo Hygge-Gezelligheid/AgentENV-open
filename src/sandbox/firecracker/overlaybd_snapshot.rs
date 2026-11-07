@@ -660,8 +660,11 @@ pub(super) async fn retain_memory_baseline(source: &Path, directory: &Path) -> R
         }
     }
     let path = directory.join("image.json");
-    write_bytes_atomically(&path, &serde_json::to_vec(&image)?, "memory baseline")?;
-    fs::File::open(directory)?.sync_all()?;
+    // This directory stays private until CLEAR succeeds and the caller adopts
+    // it. Completing the write is sufficient; recovery uses repository records.
+    tokio::fs::write(&path, serde_json::to_vec(&image)?)
+        .await
+        .context("write retained memory baseline")?;
     Ok(path)
 }
 
