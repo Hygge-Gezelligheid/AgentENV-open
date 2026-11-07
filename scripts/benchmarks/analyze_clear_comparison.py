@@ -77,7 +77,8 @@ def main():
     for cell_index, (key, cells) in enumerate(sorted(grouped.items())):
         if set(cells) != set(range(protocol['pairs'])) or any(set(pair) != {'baseline', 'candidate'} for pair in cells.values()):
             raise ValueError(f'Incomplete paired workload: {key}')
-        report = dict(memory_mib=key[0], scenario=key[1], generations=key[2], pairs=len(cells), metrics={})
+        report = dict(memory_mib=key[0], scenario=key[1], generations=key[2], pairs=len(cells),
+            paired_measurements=[dict(pair=pair, **values) for pair, values in sorted(cells.items())], metrics={})
         for metric in next(iter(cells.values()))['baseline']:
             paired = [(pair['baseline'][metric], pair['candidate'][metric]) for _, pair in sorted(cells.items())]
             result = ratios(paired, args.iterations, 20261107+cell_index)

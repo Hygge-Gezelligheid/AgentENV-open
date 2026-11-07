@@ -1,0 +1,38 @@
+{
+  "baseline": "05323abea960ab9348208d774c320d3782651544",
+  "candidate_code": "367b29fcf989fa7a0ffcc65564451f7be6b280a1",
+  "status": "Functional checks passed; original performance acceptance not established. Independent larger confirmation is running.",
+  "numeric_data": "Measurements are unchanged; task-local absolute paths are normalized. Compressed JSON includes paired raw measurements.",
+  "files": {
+    "formal3-idle.json.gz": {
+      "sha256": "a73d0db3349cc3afa65f06e32ded74ec1abe7186e96166d78ff9a02b4de97941",
+      "bytes": 17048,
+      "uncompressed_bytes": 59604
+    },
+    "formal2-idle.json.gz": {
+      "sha256": "345f49b70ae65db3b203118b7dce706782e3491b6e9cce660c7b28c79b94433f",
+      "bytes": 17040,
+      "uncompressed_bytes": 59585
+    },
+    "formal2-rotating.json.gz": {
+      "sha256": "414438b1d05089971024350e9ffb0fdbe931fc2e31c80be8229b5b99505c9251",
+      "bytes": 17175,
+      "uncompressed_bytes": 59969
+    },
+    "formal2-hotspot.json.gz": {
+      "sha256": "09a252853ce838487c1d922282a441e92d7281561fe910b7575f6e4e5bf50b75",
+      "bytes": 17094,
+      "uncompressed_bytes": 59943
+    },
+    "equivalent-layout.json.gz": {
+      "sha256": "5f626797a706649ff0b5c86099d747b5159070ca5957bc72b72bd79397292f62",
+      "bytes": 4343,
+      "uncompressed_bytes": 24637
+    },
+    "reader-idle.json.gz": {
+      "sha256": "b52fb8cbad2c10328ef456bb6cf67b37682749b7079a979dbe956bcbd9504520",
+      "bytes": 5887,
+      "uncompressed_bytes": 32089
+    }
+  }
+}

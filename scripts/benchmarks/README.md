@@ -90,3 +90,5 @@ Confirmation requires at least 30 pairs and a one-sided 95% upper ratio at most 
 for p50 and 1.10 for p95. Space reduction requires its mean-ratio upper bound
 below 1. Failed or incomplete trials invalidate the batch. Small admission
 batches remain exploratory even when their point estimates look favorable.
+Reports include the original numeric measurements grouped by paired trial, so
+confidence bounds can be recomputed without catalogs, API keys or VM artifacts.
