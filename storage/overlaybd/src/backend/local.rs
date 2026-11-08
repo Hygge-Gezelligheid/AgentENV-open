@@ -532,6 +532,17 @@ impl LocalFileInner {
                     if read == dst.len() as isize {
                         return Ok(dst.len());
                     }
+                    if read > 0 {
+                        let read = read as usize;
+                        return Ok(read
+                            + io_ring::read_exact_at(
+                                submitter,
+                                fd,
+                                &mut dst[read..],
+                                offset + read as u64,
+                            )
+                            .await?);
+                    }
                     if read == -1
                         && matches!(
                             std::io::Error::last_os_error().raw_os_error(),
@@ -542,7 +553,7 @@ impl LocalFileInner {
                     }
                 }
             }
-            // Re-read the full range on misses, short reads and EOF. This also
+            // Read the full range on misses or zero-length results. This also
             // handles kernels that return zero for a NOWAIT cache miss.
             Ok(io_ring::read_exact_at(submitter, fd, dst, offset).await?)
         }
@@ -849,16 +860,21 @@ mod tests {
 
     #[cfg(feature = "io-uring")]
     #[test]
-    #[ignore = "requires a host with io-uring enabled"]
+    #[ignore = "requires io-uring and filesystem support for RWF_NOWAIT"]
     fn buffered_cached_reads_preserve_data_and_async_fallback() {
         use storage_util::io_ring::{AsyncIoRingBuilder, URING};
         let ring = AsyncIoRingBuilder::new().build().unwrap();
         assert!(URING.with(|slot| slot.set(ring.clone())).is_ok());
         let submitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = submitted.clone();
+        let rewrite = Arc::new(std::sync::Mutex::new(None::<File>));
+        let before_submit = rewrite.clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .on_thread_park(move || {
+                if let Some(writer) = before_submit.lock().unwrap().take() {
+                    writer.write_all_at(&[0xEE; 7], 0).unwrap();
+                }
                 URING.with(|slot| {
                     let n = slot.get().unwrap().borrow().submit().unwrap();
                     count.fetch_add(n, Ordering::Relaxed);
@@ -900,6 +916,28 @@ mod tests {
                 let mut destination = vec![0; payload.len()];
                 assert_eq!(file.read_at_into_with_ctx(ctx, 0, &mut destination).await.unwrap(), payload.len());
                 assert_eq!(destination, payload);
+
+                // The park hook changes the prefix after NOWAIT copied it,
+                // before the asynchronous fallback is submitted to the kernel.
+                file.inner.nowait_supported.store(true, Ordering::Relaxed);
+                let mut destination = vec![0xFF; payload.len() + 8];
+                let vector = libc::iovec {
+                    iov_base: destination.as_mut_ptr().cast(),
+                    iov_len: destination.len(),
+                };
+                // SAFETY: this synchronous probe exclusively borrows destination.
+                let cached = unsafe {
+                    libc::preadv2(file.inner.file.as_raw_fd(), &vector, 1, 0, libc::RWF_NOWAIT)
+                };
+                assert_eq!(cached, payload.len() as isize, "requires positive cached EOF prefix");
+                destination.fill(0xFF);
+                *rewrite.lock().unwrap() = Some(OpenOptions::new().write(true).open(&path).unwrap());
+                let n = file.read_at_into_with_ctx(ctx, 0, &mut destination).await.unwrap();
+                assert_eq!(n, payload.len());
+                assert!(rewrite.lock().unwrap().is_none());
+                assert_eq!(&destination[..n], payload.as_slice(), "cached prefix must not be read twice");
+                assert_eq!(&destination[n..], &[0xFF; 8]);
+                println!("positive NOWAIT prefix preserved; asynchronous EOF tail read; PASS");
                 assert_eq!(ring.inflight_req(), 0);
             };
             tokio::select! {
