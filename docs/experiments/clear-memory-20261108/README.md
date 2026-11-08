@@ -207,6 +207,17 @@ Six subsequent resident-input probes use an isolated current-reader build with t
 
 A separate CPU microbenchmark loads the same retained input once, outside timing: 53,100 valid input mappings produce 11,691 output mappings. In 31 alternating runs, original tree versus sequential-vector merge medians are 15.245/6.980 ms. A later three-way, rotated-order microbenchmark has medians 14.700/6.981/2.670 ms for tree/sequential-vector/balanced-pair merge, with exact mapping equality in every run. Its synthetic cases also match. These warmed function measurements use different process/allocation/cache conditions from daemon preparation and cannot replace those spans or predict readiness gains. Full sources, patches, all values and build identities are retained in `fixed_state_preparation_spans_20261108` and `fixed_state_real_index_micro_20261108`. The diagnostics motivate narrower source work; no new candidate is retained on this evidence alone.
 
+A further isolated candidate changes two existing reader files: balanced-pair readonly index merging in `lsmt/index.rs`, and reuse of the existing NOWAIT decision for ordinary cached reads in `backend/local.rs`. Reference mapping tests, the explicit cached/fallback/EOF test, OverlayBD units and package Clippy passed. All 512 MiB still match the independent original memory digest, and the flattened blob digest is unchanged. Its same-driver eight-case preflight and separate 240-observation cohort completed without failures, retries or exclusions. Every payload/configuration/process/cache/cleanup check passed; resident/cold memory pages were 100%/0%. The code PR is unchanged.
+
+| Two-file candidate: medians (ms) | Current ready | Candidate ready | Current first read | Candidate first read |
+| --- | ---: | ---: | ---: | ---: |
+| Resident, 33 layers | 358.539 | 331.635 | 855.065 | 859.317 |
+| Resident, one layer | 298.298 | 295.948 | 847.789 | 1094.749 |
+| Targeted-cold, 33 layers | 589.661 | 555.802 | 1694.146 | 1667.883 |
+| Targeted-cold, one layer | 572.903 | 512.962 | 1867.348 | 1511.341 |
+
+The 33-layer readiness p50 ratio is 0.925 (one-sided upper 0.957) resident and 0.943 (upper 0.982) cold. However, resident single-layer first-read noninferiority fails: p50 ratio 1.291 (upper 1.360), mean ratio 1.091 (upper 1.159). All raw observations remain included; their substantial variation has no established cause. The candidate remains isolated pending diagnosis and is not presented as an accepted implementation. A separate task-file capability probe confirms an 8192-byte NOWAIT cache hit returns correct data and a cold read returns EAGAIN; that probe is not a trace of daemon fast-path execution. The complete sources, two-file patch, immutable program identities, all observations and independently reproduced 24 contrast statistics (maximum difference 8.88e-16) are retained under `fixed_state_preparation_candidate_20261108`. The original seven-cell acceptance remains unchanged and unmet.
+
 ## Space and retention boundary
 
 Space counts repository logical bytes and allocated node/work/serial bytes, deduplicating hard links by device/inode. Growth subtracts seeded input state and includes the running source's private baseline. Common binaries and fixed dependency images are excluded. The measured filesystem is ext4. The separate transient control runtime directories contained no regular files in the completed batch; writable device data lives under the counted work directories.
@@ -360,45 +371,35 @@ for metric, saved in study['statistics']['metrics'].items():
                                 rel_tol=1e-12, abs_tol=1e-12)
 print('ARM diagnostic ratios reproduced')
 
-study = json.load(gzip.open('docs/experiments/clear-memory-20261108/formal4-control-audit.json.gz', 'rt'))['fixed_state_reader_layout_20261108']
-points = {(r['cache_profile'], r['block'], r['reader'], r['layout']): r for r in study['measurements']}
-contrasts = (
-    ('current/baseline reader, layered', ('baseline-reader', 'layered'), ('current-reader', 'layered')),
-    ('current/baseline reader, flat', ('baseline-reader', 'flat'), ('current-reader', 'flat')),
-    ('layered/flat, baseline reader', ('baseline-reader', 'flat'), ('baseline-reader', 'layered')),
-    ('layered/flat, current reader', ('current-reader', 'flat'), ('current-reader', 'layered')),
-)
-for profile, result in study['analysis']['profiles'].items():
-    for label, denominator, numerator in contrasts:
-        for metric, saved in result['contrasts'][label].items():
-            recalculated = ratios([([points[(profile, b) + denominator][metric]],
-                                    [points[(profile, b) + numerator][metric]]) for b in range(30)],
-                                  10000, 20261108)
-            for statistic in ('p50', 'p95', 'mean'):
-                for field in ('ratio', 'upper_95_one_sided'):
-                    assert math.isclose(recalculated[statistic][field], saved[statistic][field],
-                                        rel_tol=1e-12, abs_tol=1e-12)
-print('All 24 prospective reader/layout contrast statistics reproduced')
-
-study = json.load(gzip.open('docs/experiments/clear-memory-20261108/formal4-control-audit.json.gz', 'rt'))['fixed_state_linear_index_comparison_20261108']
-points = {(r['cache_profile'], r['block'], r['reader'], r['layout']): r for r in study['measurements']}
-contrasts = (
-    ('linear/tree index, layered', ('tree-index', 'layered'), ('linear-index', 'layered')),
-    ('linear/tree index, flat', ('tree-index', 'flat'), ('linear-index', 'flat')),
-    ('layered/flat, tree index', ('tree-index', 'flat'), ('tree-index', 'layered')),
-    ('layered/flat, linear index', ('linear-index', 'flat'), ('linear-index', 'layered')),
-)
-for profile, result in study['analysis']['profiles'].items():
-    for label, denominator, numerator in contrasts:
-        for metric, saved in result['contrasts'][label].items():
-            recalculated = ratios([([points[(profile, b) + denominator][metric]],
-                                    [points[(profile, b) + numerator][metric]]) for b in range(30)],
-                                  10000, 20261108)
-            for statistic in ('p50', 'p95', 'mean'):
-                for field in ('ratio', 'upper_95_one_sided'):
-                    assert math.isclose(recalculated[statistic][field], saved[statistic][field],
-                                        rel_tol=1e-12, abs_tol=1e-12)
-print('All 24 index-candidate contrast statistics reproduced')
+audit = json.load(gzip.open('docs/experiments/clear-memory-20261108/formal4-control-audit.json.gz', 'rt'))
+for namespace, old, new, comparison, old_label, new_label in (
+    ('fixed_state_reader_layout_20261108', 'baseline-reader', 'current-reader',
+     'current/baseline reader', 'baseline reader', 'current reader'),
+    ('fixed_state_linear_index_comparison_20261108', 'tree-index', 'linear-index',
+     'linear/tree index', 'tree index', 'linear index'),
+    ('fixed_state_preparation_candidate_20261108', 'tree-index', 'prepared-reader',
+     'prepared/current reader', 'current reader', 'prepared reader'),
+):
+    study = audit[namespace]
+    points = {(r['cache_profile'], r['block'], r['reader'], r['layout']): r for r in study['measurements']}
+    assert len(points) == len(study['measurements']) == 240
+    contrasts = (
+        (comparison + ', layered', (old, 'layered'), (new, 'layered')),
+        (comparison + ', flat', (old, 'flat'), (new, 'flat')),
+        ('layered/flat, ' + old_label, (old, 'flat'), (old, 'layered')),
+        ('layered/flat, ' + new_label, (new, 'flat'), (new, 'layered')),
+    )
+    for profile, result in study['analysis']['profiles'].items():
+        for label, denominator, numerator in contrasts:
+            for metric, saved in result['contrasts'][label].items():
+                recalculated = ratios([([points[(profile, b) + denominator][metric]],
+                                        [points[(profile, b) + numerator][metric]]) for b in range(30)],
+                                      10000, 20261108)
+                for statistic in ('p50', 'p95', 'mean'):
+                    for field in ('ratio', 'upper_95_one_sided'):
+                        assert math.isclose(recalculated[statistic][field], saved[statistic][field],
+                                            rel_tol=1e-12, abs_tol=1e-12)
+    print(namespace, '24 complete-block contrast statistics reproduced')
 PYCODE
 ```
 
