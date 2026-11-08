@@ -180,7 +180,18 @@ Six subsequent, separately declared resident-input probes used the unchanged cur
 
 Six further, separately declared CPU-sampling probes attached only to the verified frozen current daemon (`cpu-clock:u`, 1999 Hz, DWARF stacks). Before the first Firecracker file event, the three 33-layer windows contained 76/80/81 user samples, of which 58/57/53 (76.3%/71.3%/65.4%) were self samples in `SegmentMapping` tree operations, `MutableIndex::insert` or `ReadOnlyIndex::merge`. The single-layer windows had 23/22/19 samples, including 12/14/14 in those operations. Every window had zero lost samples. This implicates readonly index preparation as a CPU hotspot; sample fractions are not wall-time fractions, and the window also includes common rootfs preparation. Raw stack data remains private. Source, protocol, aggregate symbols and all six probes are retained under `fixed_state_preparation_cpu_20261108`. The initial wrapper incorrectly rejected its deliberate SIGINT stop; that failed attempt is retained separately, and the corrected six probes use readable-file validation and explicit control acknowledgements. These samples are excluded from B and A.
 
-All 24 contrast/endpoint statistics were independently reproduced from raw rows using the frozen original quantile/bootstrap functions and 10000 whole-block resamples, within 1e-12 (maximum absolute difference 1.11e-15). All primary formal4 numeric files remain unchanged; six of seven original latency cells still fail. Next work should localize the preparation interval before retaining another product change.
+All 24 contrast/endpoint statistics were independently reproduced from raw rows using the frozen original quantile/bootstrap functions and 10000 whole-block resamples, within 1e-12 (maximum absolute difference 1.11e-15). All primary formal4 numeric files remain unchanged; six of seven original latency cells still fail.
+
+A subsequent one-file candidate replaced `ReadOnlyIndex::merge` tree replay with ordered vector scans. This separate frozen study used the current tree reader (`e345d97e...`) versus candidate (`7fdf6430...`), the same 33-layer and flattened complete VM state, the same common API/Firecracker, and 30 randomized complete eight-cell blocks (240 observations). The compiler, features and profiles match; exactly one of 872 source files differs. Eight exact-driver preflight checks, 409 OverlayBD unit tests (four ignored), package Clippy and an independent full 512 MiB memory oracle passed. All 240 payload/configuration/process/cache/cleanup checks passed, with 100% resident or 0% cold memory pages; no observation was retried or excluded.
+
+| Index-candidate study: readiness median (ms) | Current tree | Vector candidate | Candidate/current p50 ratio (one-sided upper) |
+| --- | ---: | ---: | ---: |
+| Resident, 33 layers | 354.214 | 352.956 | 0.996 (1.036) |
+| Resident, one layer | 322.171 | 299.177 | 0.929 (0.972) |
+| Targeted-cold, 33 layers | 571.608 | 570.707 | 0.998 (1.015) |
+| Targeted-cold, one layer | 544.385 | 533.337 | 0.980 (1.037) |
+
+The candidate does not demonstrate a useful readiness improvement on the 33-layer target. It was removed from the code branch; its patch, build receipt, protocol, all raw observations and all 24 contrast/endpoint calculations remain in `fixed_state_linear_index_comparison_20261108`. Independent recomputation agrees within 1e-12 (maximum difference 5.55e-16). The CPU hotspot alone did not establish that this rewrite would reduce end-to-end latency. Single-layer gains do not resolve the long-chain regression. These results are separate from B and A; the original six failed latency cells remain unchanged.
 
 ## Space and retention boundary
 
@@ -354,6 +365,26 @@ for profile, result in study['analysis']['profiles'].items():
                     assert math.isclose(recalculated[statistic][field], saved[statistic][field],
                                         rel_tol=1e-12, abs_tol=1e-12)
 print('All 24 prospective reader/layout contrast statistics reproduced')
+
+study = json.load(gzip.open('docs/experiments/clear-memory-20261108/formal4-control-audit.json.gz', 'rt'))['fixed_state_linear_index_comparison_20261108']
+points = {(r['cache_profile'], r['block'], r['reader'], r['layout']): r for r in study['measurements']}
+contrasts = (
+    ('linear/tree index, layered', ('tree-index', 'layered'), ('linear-index', 'layered')),
+    ('linear/tree index, flat', ('tree-index', 'flat'), ('linear-index', 'flat')),
+    ('layered/flat, tree index', ('tree-index', 'flat'), ('tree-index', 'layered')),
+    ('layered/flat, linear index', ('linear-index', 'flat'), ('linear-index', 'layered')),
+)
+for profile, result in study['analysis']['profiles'].items():
+    for label, denominator, numerator in contrasts:
+        for metric, saved in result['contrasts'][label].items():
+            recalculated = ratios([([points[(profile, b) + denominator][metric]],
+                                    [points[(profile, b) + numerator][metric]]) for b in range(30)],
+                                  10000, 20261108)
+            for statistic in ('p50', 'p95', 'mean'):
+                for field in ('ratio', 'upper_95_one_sided'):
+                    assert math.isclose(recalculated[statistic][field], saved[statistic][field],
+                                        rel_tol=1e-12, abs_tol=1e-12)
+print('All 24 index-candidate contrast statistics reproduced')
 PYCODE
 ```
 
