@@ -1,7 +1,7 @@
 {
   "baseline": "05323abea960ab9348208d774c320d3782651544",
   "candidate_code": "367b29fcf989fa7a0ffcc65564451f7be6b280a1",
-  "status": "Functional checks passed; all four completed confirmation cells fail one or more original latency gates and pass primary space reduction. Two 4 GiB cells and the 96-generation cell are pending.",
+  "status": "All seven formal4 confirmation cells are complete and pass payload/deletion and primary retained-history space checks. Six cells fail at least one unchanged latency gate; only 4096 MiB dense passes all latency gates. Later untimed runtime controls do not change acceptance.",
   "numeric_data": "Measurements are unchanged; task-local absolute paths are normalized. Compressed JSON includes paired raw measurements.",
   "files": {
     "formal3-idle.json.gz": {
@@ -85,8 +85,8 @@
       "bytes": 91896
     },
     "formal4-control-audit.json.gz": {
-      "sha256": "461dab3ce9003870fe21ca64bcecbffbf16a19eaf0fb2699388d64c164959a48",
-      "bytes": 16333
+      "sha256": "67ace9d661307e70d0136aa16669fc37fe5d11f1e4daf79177de7eda20ae218e",
+      "bytes": 27525
     }
   }
 }
