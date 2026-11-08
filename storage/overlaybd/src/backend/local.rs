@@ -9,6 +9,8 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "io-uring")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::io::virtual_file::VirtualFile;
@@ -130,6 +132,8 @@ impl LocalFileBuilder {
                 path,
                 file,
                 direct_io: self.direct_io,
+                #[cfg(feature = "io-uring")]
+                nowait_supported: AtomicBool::new(true),
                 #[cfg(test)]
                 write_calls: std::sync::atomic::AtomicU64::new(0),
             }),
@@ -147,6 +151,8 @@ struct LocalFileInner {
     path: PathBuf,
     file: File,
     direct_io: bool,
+    #[cfg(feature = "io-uring")]
+    nowait_supported: AtomicBool,
     /// Test-only probe counting synchronous positional-write submissions (the
     /// buffered small-write fast path plus explicit sync-pwrite calls).
     #[cfg(test)]
@@ -513,6 +519,31 @@ impl LocalFileInner {
                 Ok(n)
             }
         } else {
+            if self.nowait_supported.load(Ordering::Relaxed) {
+                if let Ok(file_offset) = libc::off_t::try_from(offset) {
+                    let vector = libc::iovec {
+                        iov_base: dst.as_mut_ptr().cast(),
+                        iov_len: dst.len(),
+                    };
+                    // SAFETY: preadv2 completes synchronously while dst remains
+                    // exclusively borrowed. NOWAIT never waits for backing I/O.
+                    let read =
+                        unsafe { libc::preadv2(fd, &vector, 1, file_offset, libc::RWF_NOWAIT) };
+                    if read == dst.len() as isize {
+                        return Ok(dst.len());
+                    }
+                    if read == -1
+                        && matches!(
+                            std::io::Error::last_os_error().raw_os_error(),
+                            Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL)
+                        )
+                    {
+                        self.nowait_supported.store(false, Ordering::Relaxed);
+                    }
+                }
+            }
+            // Re-read the full range on misses, short reads and EOF. This also
+            // handles kernels that return zero for a NOWAIT cache miss.
             Ok(io_ring::read_exact_at(submitter, fd, dst, offset).await?)
         }
     }
@@ -815,6 +846,68 @@ mod tests {
     use super::*;
     use storage_util::AlignedBuffer;
     use tempfile::{NamedTempFile, TempDir};
+
+    #[cfg(feature = "io-uring")]
+    #[test]
+    #[ignore = "requires a host with io-uring enabled"]
+    fn buffered_cached_reads_preserve_data_and_async_fallback() {
+        use storage_util::io_ring::{AsyncIoRingBuilder, URING};
+        let ring = AsyncIoRingBuilder::new().build().unwrap();
+        assert!(URING.with(|slot| slot.set(ring.clone())).is_ok());
+        let submitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = submitted.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_park(move || {
+                URING.with(|slot| {
+                    let n = slot.get().unwrap().borrow().submit().unwrap();
+                    count.fetch_add(n, Ordering::Relaxed);
+                });
+            })
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async {
+            let run = async {
+                let directory = TempDir::new().unwrap();
+                let path = directory.path().join("cached-read");
+                let payload = (0..16391).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+                std::fs::write(&path, &payload).unwrap();
+                let file = LocalFile::open_ro(&path).unwrap();
+                file.sync().await.unwrap();
+                let ctx = IoCtx::new(&ring);
+                for cached in [true, false] {
+                    file.inner.nowait_supported.store(cached, Ordering::Relaxed);
+                    let before = submitted.load(Ordering::Relaxed);
+                    let mut destination = vec![0; 4096];
+                    assert_eq!(file.read_at_into_with_ctx(ctx, 7, &mut destination).await.unwrap(), 4096);
+                    assert_eq!(destination, payload[7..4103]);
+                    if cached && file.inner.nowait_supported.load(Ordering::Relaxed) {
+                        assert_eq!(submitted.load(Ordering::Relaxed), before);
+                    } else {
+                        assert!(submitted.load(Ordering::Relaxed) > before);
+                    }
+                    // A partial cached read must still complete the request up
+                    // to EOF and preserve the untouched destination tail.
+                    let mut destination = vec![0xFF; payload.len()+8];
+                    let n = file.read_at_into_with_ctx(ctx, 0, &mut destination).await.unwrap();
+                    assert_eq!(n, payload.len());
+                    assert_eq!(&destination[..n], payload.as_slice());
+                    assert_eq!(&destination[n..], &[0xFF; 8]);
+                    assert_eq!(file.read_at_into_with_ctx(ctx, n as u64, &mut destination[..8]).await.unwrap(), 0);
+                }
+                file.inner.nowait_supported.store(true, Ordering::Relaxed);
+                file.evict_all().await.unwrap();
+                let mut destination = vec![0; payload.len()];
+                assert_eq!(file.read_at_into_with_ctx(ctx, 0, &mut destination).await.unwrap(), payload.len());
+                assert_eq!(destination, payload);
+                assert_eq!(ring.inflight_req(), 0);
+            };
+            tokio::select! {
+                result = tokio::time::timeout(std::time::Duration::from_secs(10), run) => result.unwrap(),
+                result = ring.handle_completion() => panic!("completion loop exited: {result:?}"),
+            }
+        });
+    }
 
     /// Open a fresh O_DIRECT file at `path` (truncated).
     fn open_direct_io_file(path: impl AsRef<std::path::Path>) -> LocalFile {
