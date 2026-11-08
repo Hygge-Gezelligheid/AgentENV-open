@@ -222,6 +222,21 @@ A separate 30-pair resident-flat CPU diagnostic retains 60 complete observations
 
 The [kernel scheduler-stat documentation](https://www.kernel.org/doc/html/latest/scheduler/sched-stats.html) distinguishes running CPU time from runqueue waiting. Collection of the latter was disabled when checked after the batch; zero wait fields are excluded from interpretation. User ticks already include guest time, so the derivation does not add guest ticks again ([Linux proc_pid_stat documentation](https://www.kernel.org/pub/linux/docs/man-pages/book/man-pages-6.10.pdf)). Endpoint CPU IDs and whole-VM NUMA page counts also do not identify hot-page locality or intermediate migrations. Sources, all 60 raw observations, coverage checks and the reproducible derivation are retained under `fixed_state_first_read_cpu_20261108`. No host scheduling settings were changed, and the resident-flat noninferiority failure remains outstanding.
 
+## First-read work counters, separate diagnostic cohort
+
+The completed PMU study contains 30 randomized resident-flat pairs (60 fresh nodes), comparing current reader `e345d97` with the isolated two-file preparation candidate `e0542ee`. It uses the same saved VM state, common API server `674a724`, Firecracker, two vCPUs, payload and verified resident memory input. All 60 checksum, program/UID, coverage and cleanup checks pass; source/protocol hashes remain unchanged. A separate two-observation instrumentation preflight passed before the cohort. No observations were excluded or repeated.
+
+| Instrumented work median | Current reader | Preparation candidate |
+| --- | ---: | ---: |
+| Guest instructions, both vCPU threads | 941,962,357 | 939,379,165.5 |
+| Guest cycles, both vCPU threads | 1,149,960,429 | 1,166,659,968.5 |
+| Reader instructions, all stable threads | 128,908,595 | 130,157,742 |
+| Reader cycles, all stable threads | 306,259,715.5 | 304,892,526.5 |
+
+`cycles:G,instructions:G` count guest execution on the two owned vCPU threads; `:H` counts the owned reader's host execution. Events start disabled, with enable/disable acknowledgements around the checksum. Active counters require >=99% coverage; inactive reader threads have zero runtime and remain included as zero. The interpretation follows Linux v6.8 [event modifiers](https://github.com/torvalds/linux/blob/v6.8/tools/perf/Documentation/perf-list.txt) and [perf-stat controls](https://github.com/torvalds/linux/blob/v6.8/tools/perf/Documentation/perf-stat.txt).
+
+These are perturbed observations: counter windows include control overhead and vCPU counts include guest background work. Similar median work does not establish a cause of elapsed-time variation, measure CPU frequency, or waive the previously failed uninstrumented resident-flat gate. The cohort is not pooled with any timing or acceptance study. All raw numeric observations, native CSV strings, preflight, analysis and source are in `formal4-control-audit.json.gz` under `fixed_state_first_read_pmu_20261108`. Independent integer CSV accumulation reproduces all 60 work totals and all 48 work summary values. No guest memory or sampled stack bytes are published.
+
 ## Space and retention boundary
 
 Space counts repository logical bytes and allocated node/work/serial bytes, deduplicating hard links by device/inode. Growth subtracts seeded input state and includes the running source's private baseline. Common binaries and fixed dependency images are excluded. The measured filesystem is ext4. The separate transient control runtime directories contained no regular files in the completed batch; writable device data lives under the counted work directories.
@@ -422,6 +437,26 @@ with tempfile.TemporaryDirectory() as directory:
     verifier = root / 'tools/verify-read-geometry.py'
     verifier.write_text(bundle['sources']['verify-read-geometry.py'])
     subprocess.run([sys.executable, str(verifier)], check=True)
+PYCODE
+```
+
+To reproduce the PMU diagnostic from the embedded CSVs and frozen metadata:
+
+```bash
+python3 - <<'PYCODE'
+import gzip, json, pathlib, subprocess, sys, tempfile
+bundle = json.load(gzip.open('docs/experiments/clear-memory-20261108/formal4-control-audit.json.gz', 'rt'))
+study = bundle['fixed_state_first_read_pmu_20261108']
+with tempfile.TemporaryDirectory() as directory:
+    root = pathlib.Path(directory)
+    (root / 'protocol.json').write_text(study['protocol_json'])
+    (root / 'progress.json').write_text(json.dumps(study['progress']))
+    (root / 'protocol.sha256').write_text(study['analysis']['protocol_sha256'] + '\n')
+    (root / 'observations.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in study['observations']))
+    script = root / 'analyze-first-read-cpu.py'
+    script.write_text(study['sources']['analyze-first-read-cpu.py'])
+    subprocess.run([sys.executable, str(script), '--pmu', str(root)], check=True)
+    assert json.loads((root / 'analysis.json').read_text()) == study['analysis']
 PYCODE
 ```
 
