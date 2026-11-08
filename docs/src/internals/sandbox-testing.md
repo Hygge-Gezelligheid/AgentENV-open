@@ -804,4 +804,3 @@ and matching OSS settings in the ublk memory/rootfs global configurations.
 Use only a disposable local test service. Without that variable the same case
 runs against POSIX storage. The suite also exercises tracking disabled and
 captures while atomic tmpfs/ext4 file replacement runs continuously.
-
