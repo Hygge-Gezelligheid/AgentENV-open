@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::mem::size_of;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Weak};
 use tempfile::TempDir;
 use tokio::sync::{Mutex as TokioMutex, Notify};
@@ -4080,4 +4080,133 @@ async fn test_direct_io_create_sparse() {
 
     assert_eq!(lsmt.size().await.unwrap(), vsize);
     assert_eq!(lsmt.file_type(), LSMTFileType::SparseReadWrite);
+}
+
+struct GatedMappedRead {
+    value: u8,
+    fail: bool,
+    started: Arc<AtomicUsize>,
+    released: Arc<AtomicBool>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl VirtualFile for GatedMappedRead {
+    async fn read_at(&self, _offset: u64, len: usize) -> Result<Bytes> {
+        self.started.fetch_add(1, AtomicOrdering::SeqCst);
+        if self.fail {
+            bail!("injected mapped read failure");
+        }
+        if !self.released.load(AtomicOrdering::SeqCst) {
+            self.release.notified().await;
+        }
+        Ok(Bytes::from(vec![self.value; len]))
+    }
+    async fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<usize> {
+        bail!("read-only probe")
+    }
+    async fn size(&self) -> Result<u64> {
+        Ok(4096)
+    }
+}
+
+fn gated_mapped_read_stack(
+    fail_first: bool,
+) -> (
+    LSMTReadOnlyFile,
+    Arc<AtomicUsize>,
+    Arc<AtomicBool>,
+    Arc<Notify>,
+) {
+    let started = Arc::new(AtomicUsize::new(0));
+    let released = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(Notify::new());
+    let layers = [0x55, 0xAA]
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            Arc::new(GatedMappedRead {
+                value,
+                fail: fail_first && index == 0,
+                started: started.clone(),
+                released: released.clone(),
+                release: release.clone(),
+            }) as Arc<dyn VirtualFile>
+        })
+        .collect();
+    let index = Arc::new(ReadOnlyIndex::new(vec![
+        SegmentMapping::new(0, 8, 0, false, 0),
+        SegmentMapping::new(8, 8, 0, true, 0),
+        // A hole separates the explicit zero extent from the second layer.
+        SegmentMapping::new(24, 8, 0, false, 1),
+    ]));
+    (
+        LSMTReadOnlyFile::from_merged_layers(
+            layers,
+            index,
+            16384,
+            vec![Uuid::nil(); 2],
+            LSMTFileType::ReadOnly,
+        ),
+        started,
+        released,
+        release,
+    )
+}
+
+#[tokio::test]
+async fn readonly_fragment_reads_overlap_and_preserve_holes_and_zeros() {
+    let (file, started, released, release) = gated_mapped_read_stack(false);
+    let mut destination = vec![0xFF; 16384];
+    {
+        let read = file.read_at_into(0, &mut destination);
+        tokio::pin!(read);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), read.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            started.load(AtomicOrdering::SeqCst),
+            2,
+            "both independent reads must start before either completes"
+        );
+        released.store(true, AtomicOrdering::SeqCst);
+        release.notify_waiters();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), read)
+                .await
+                .unwrap()
+                .unwrap(),
+            16384
+        );
+    }
+    assert_eq!(&destination[..4096], &[0x55; 4096]);
+    assert_eq!(&destination[4096..12288], &[0; 8192]);
+    assert_eq!(&destination[12288..], &[0xAA; 4096]);
+}
+
+#[tokio::test]
+async fn readonly_fragment_error_waits_for_other_borrowed_reads() {
+    let (file, started, released, release) = gated_mapped_read_stack(true);
+    let mut destination = vec![0xFF; 16384];
+    {
+        let read = file.read_at_into(0, &mut destination);
+        tokio::pin!(read);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), read.as_mut())
+                .await
+                .is_err(),
+            "an error must not drop another in-flight read borrowing the caller buffer"
+        );
+        assert_eq!(started.load(AtomicOrdering::SeqCst), 2);
+        released.store(true, AtomicOrdering::SeqCst);
+        release.notify_waiters();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), read)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_err_contains(&error, "injected mapped read failure");
+    }
+    assert_eq!(&destination[12288..], &[0xAA; 4096]);
 }

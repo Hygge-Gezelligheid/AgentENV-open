@@ -490,6 +490,33 @@ impl FirecrackerInstance {
             .context("Failed to get dirty memory ranges")
     }
 
+    #[cfg(test)]
+    pub fn redirect_api_for_test(&mut self, path: PathBuf) -> PathBuf {
+        self.client = UnixSocketClient::new(path);
+        self.socket_path.clone()
+    }
+
+    #[cfg(test)]
+    pub async fn guest_memory_regions_for_test(
+        &self,
+    ) -> Result<Vec<firecracker_client::models::GuestRegionUffdMapping>> {
+        self.client
+            .request::<(), _>(Method::GET, "/vm/guest-memory-regions", None)
+            .await
+    }
+
+    /// Clear dirty records only after the caller owns a complete memory baseline.
+    pub async fn clear_dirty_memory(&self) -> Result<()> {
+        self.client
+            .request_no_content(
+                Method::PUT,
+                "/vm/dirty-memory-ranges/clear",
+                Some(&serde_json::json!({})),
+            )
+            .await
+            .context("Failed to clear dirty memory records")
+    }
+
     /// Loads a snapshot with uffd memory backend.
     /// Pre-boot only.
     #[allow(dead_code)]
@@ -630,6 +657,62 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn clear_dirty_memory_sends_empty_object_and_propagates_errors() -> Result<()> {
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::{Bytes, Incoming};
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::{Request, Response, StatusCode};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use tokio::net::UnixListener;
+
+        for status in [StatusCode::NO_CONTENT, StatusCode::BAD_REQUEST] {
+            let temp = tempdir()?;
+            let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+            let listener = UnixListener::bind(&instance.socket_path)?;
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |request: Request<Incoming>| async move {
+                            assert_eq!(request.method(), Method::PUT);
+                            assert_eq!(request.uri().path(), "/vm/dirty-memory-ranges/clear");
+                            let body = request.collect().await.unwrap().to_bytes();
+                            assert_eq!(body.as_ref(), b"{}");
+                            let body = if status == StatusCode::NO_CONTENT {
+                                ""
+                            } else {
+                                r#"{"fault_message":"dirty log failure"}"#
+                            };
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(status)
+                                    .body(Full::new(Bytes::from_static(body.as_bytes())))
+                                    .unwrap(),
+                            )
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let result = instance.clear_dirty_memory().await;
+            if status == StatusCode::NO_CONTENT {
+                result?;
+            } else {
+                assert!(format!("{:#}", result.unwrap_err()).contains("dirty log failure"));
+            }
+            server.await?;
+        }
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        assert!(instance.clear_dirty_memory().await.is_err());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn wait_for_ready_times_out_when_socket_never_appears() {
