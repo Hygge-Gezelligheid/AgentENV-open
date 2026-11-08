@@ -778,7 +778,7 @@ cargo test -p agentenv --lib memory_baseline
 cargo test -p agentenv --lib clear_dirty_memory
 cargo test -p agentenv --lib unreliable_memory_tracking
 scripts/run-with-capabilities.sh cargo test -p agentenv --test integration \
-  clear::consecutive_captures -- --ignored --nocapture --test-threads=1
+  snapshot::incremental_captures_restore_every_generation -- --ignored --nocapture --test-threads=1
 ```
 
 Use isolated state, runtime, and dependency directories as described above.
@@ -795,7 +795,7 @@ scripts/run-with-capabilities.sh cargo test -p agentenv --lib \
 scripts/run-with-capabilities.sh cargo test -p agentenv --lib \
   clear_failure_or_lost_response_never_resumes_instance -- --ignored --nocapture
 scripts/run-with-capabilities.sh cargo test -p agentenv --test integration \
-  clear:: -- --ignored --nocapture --test-threads=1
+  snapshot::incremental_ -- --ignored --nocapture --test-threads=1
 ```
 
 The OSS fresh-cache case uses `AENV_CLEAR_OSS_ENDPOINT`, an isolated
