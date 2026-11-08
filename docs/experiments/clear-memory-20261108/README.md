@@ -193,6 +193,20 @@ A subsequent one-file candidate replaced `ReadOnlyIndex::merge` tree replay with
 
 The candidate does not demonstrate a useful readiness improvement on the 33-layer target. It was removed from the code branch; its patch, build receipt, protocol, all raw observations and all 24 contrast/endpoint calculations remain in `fixed_state_linear_index_comparison_20261108`. Independent recomputation agrees within 1e-12 (maximum difference 5.55e-16). The CPU hotspot alone did not establish that this rewrite would reduce end-to-end latency. Single-layer gains do not resolve the long-chain regression. These results are separate from B and A; the original six failed latency cells remain unchanged.
 
+Six subsequent resident-input probes use an isolated current-reader build with timing spans in three existing modules; those markers are excluded from product code. Actual program identities, payloads and cleanup pass for all six. Each target has distinct rootfs and memory-device spans; the following table uses the memory spans only (three observations/layout). These instrumented values are diagnostic, with no confidence or acceptance claim. Component medians do not sum to the total median.
+
+| Preparation stage, median ms | 33 layers | One layer |
+| --- | ---: | ---: |
+| Open lower files and adapt formats | 17.463 | 0.244 |
+| Load indexes after metadata | 4.147 | 1.003 |
+| Merge readonly indexes | 33.476 | 7.651 |
+| Complete image open | 56.270 | 9.206 |
+| Build ublk device | 27.224 | 27.223 |
+| Start ublk device | 12.957 | 11.827 |
+| Wait until device is readable | 20.597 | 20.584 |
+
+A separate CPU microbenchmark loads the same retained input once, outside timing: 53,100 valid input mappings produce 11,691 output mappings. In 31 alternating runs, original tree versus sequential-vector merge medians are 15.245/6.980 ms. A later three-way, rotated-order microbenchmark has medians 14.700/6.981/2.670 ms for tree/sequential-vector/balanced-pair merge, with exact mapping equality in every run. Its synthetic cases also match. These warmed function measurements use different process/allocation/cache conditions from daemon preparation and cannot replace those spans or predict readiness gains. Full sources, patches, all values and build identities are retained in `fixed_state_preparation_spans_20261108` and `fixed_state_real_index_micro_20261108`. The diagnostics motivate narrower source work; no new candidate is retained on this evidence alone.
+
 ## Space and retention boundary
 
 Space counts repository logical bytes and allocated node/work/serial bytes, deduplicating hard links by device/inode. Growth subtracts seeded input state and includes the running source's private baseline. Common binaries and fixed dependency images are excluded. The measured filesystem is ext4. The separate transient control runtime directories contained no regular files in the completed batch; writable device data lives under the counted work directories.
