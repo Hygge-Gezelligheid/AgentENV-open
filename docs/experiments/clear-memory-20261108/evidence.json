@@ -71,6 +71,22 @@
     "reader-geometry-arm.json.gz": {
       "sha256": "17c84eb62abd4002a18c2ad1ca24144c2a4ef7dc3ab169b22a45a50bd8a32c6f",
       "bytes": 38460
+    },
+    "formal4-4096-rotating.json.gz": {
+      "sha256": "3d2827df212bf27f2b4a2253a7cb978b1abe0202931b2f9cf70592d723ced1e2",
+      "bytes": 17522
+    },
+    "formal4-4096-dense.json.gz": {
+      "sha256": "0159e759976dc56db42a94062c444b8f441a6e8fe7a8258779d34f23f28ff8b9",
+      "bytes": 17894
+    },
+    "formal4-long.json.gz": {
+      "sha256": "0118013ef6cefa2dc82983e47214ca39b0874af227e9d183e4f216eb21fcdf19",
+      "bytes": 91896
+    },
+    "formal4-control-audit.json.gz": {
+      "sha256": "6212af758fc95e198ff1afbecec53bf99cf81f4769052d0170ea56dc633c20e0",
+      "bytes": 3853
     }
   }
 }

@@ -1,6 +1,6 @@
 # CLEAR memory baseline experiment
 
-Status on 2026-11-08: correctness checks pass; the original performance acceptance is **not yet established**. All four independent 512 MiB confirmation cells completed and passed primary space reduction, but each fails one or more original latency gates. Results for the two 4 GiB cells and the 96-generation cell remain to be collected and verified. Keep this review in draft.
+Status on 2026-11-08: all seven fixed confirmation cells completed, with payload/deletion checks and primary retained-history space reduction passing. Six cells fail one or more unchanged latency gates; only the 4 GiB dense cell passes every latency gate. Performance acceptance is **not established**. This PR preserves experimental evidence; the implementation is reviewed separately in the code PR.
 
 ## Implementation
 
@@ -50,7 +50,7 @@ The larger independent confirmation fixes pair counts at **120/60/60/30/30/30/30
 
 ## Earlier current-code 30-pair idle result
 
-Candidate/original ratios below show point estimate followed by the one-sided 95% upper bound. This is the complete `367b29f` formal3 idle cell, not the pending larger confirmation.
+Candidate/original ratios below show point estimate followed by the one-sided 95% upper bound. This is the complete `367b29f` formal3 idle cell, separate from the completed larger confirmation.
 
 | Endpoint | p50 ratio (upper) | p95 ratio (upper) | Original gate |
 | --- | ---: | ---: | --- |
@@ -105,7 +105,41 @@ Allocated growth mean ratios are 0.416 (upper 0.429) for rotating and 0.553 (upp
 
 The 512 MiB dense cell completed all 30 pairs with payload/deletion checks passing. Primary allocated growth fell by about 8%: mean ratio 0.921 (upper 0.926). Repository logical-byte mean ratio was 0.932 (upper 0.937). Warm readiness failed with p50 1.064 (upper 1.094) and p95 1.135 (upper 1.209). Targeted-cold first-read p50 also failed its confidence gate: 1.021 (upper 1.099). Every other latency gate passed, including warm combined p50 0.996 (upper 1.029) and cold combined p50 0.990 (upper 1.023).
 
-Latest-only retention remains a material boundary: after old-record deletion this dense cell references 3.657 times the original total managed-layer bytes including seeds, or 7.147 times the additional referenced bytes above seeds. Whole-history storage improvement does not establish latest-only storage improvement. The two 4 GiB cells and the 96-generation cell remain pending.
+Latest-only retention remains a material boundary: after old-record deletion this dense cell references 3.657 times the original total managed-layer bytes including seeds, or 7.147 times the additional referenced bytes above seeds. Whole-history storage improvement does not establish latest-only storage improvement. The remaining cells are now complete; their results and endpoint audit appear below.
+
+## Completed 4 GiB and 96-generation confirmations
+
+Each remaining cell completed 30 independent pairs. Saved statistics were independently reproduced from all 30 complete paired measurements with the original 10000 whole-pair bootstrap. No timing was rerun or pooled with diagnostic studies.
+
+| Cell | Allocated growth mean ratio (upper) | Original latency gates |
+| --- | ---: | --- |
+| 4096 MiB rotating, eight generations | 0.333 (0.345) | Fail: warm-ready p50 upper 1.055 |
+| 4096 MiB dense, eight generations | 0.974 (0.976) | All pass |
+| 512 MiB rotating, 96 generations | 0.125 (0.127) | Fail: warm ready, first-read p50 and combined p50 |
+
+Latest-only referenced bytes remain larger: 4 GiB dense retains 6.661 times the original total bytes including seeds, or 7.762 times the additional bytes above seeds. The long chain retains 2.019/3.417 times respectively. These are retained references, not garbage-collection measurements.
+
+## Control and endpoint audit
+
+The 20.51% readiness increase compares **the same 96-generation workload in both implementations**, not 96 generations against eight. Each of 30 paired trials starts from the same 512 MiB seed, performs 96 rotating writes of about 1% of guest RAM, and restores generation 95 (zero-based) through the same public API driver. The source VM remains running. Every trial has all 96 saves and exactly one restore in each recorded cache mode; all paired payload checksums match. Baseline source is `05323abe`; candidate runtime is `367b29f`. Matching baseline/candidate server-daemon pairs are used, with identical pinned Firecracker, guest kernel, seed, driver and endpoint boundaries. Order is randomized within each pair.
+
+| Endpoint, 30 observations per implementation | Original median ms | Candidate median ms | Ratio |
+| --- | ---: | ---: | ---: |
+| Post-save first restore: ready | 296.394 | 357.190 | 1.2051 |
+| Post-save first restore: first checksum | 916.723 | 997.440 | 1.0880 |
+| Post-save first restore: ready + checksum | 1228.790 | 1367.342 | 1.1128 |
+| Targeted-cold restore: ready | 612.278 | 529.286 | 0.8645 |
+| Targeted-cold restore: ready + checksum | 2668.396 | 2186.006 | 0.8192 |
+
+Ratios divide the two sample medians; they are not medians of per-pair ratios. Combined medians are computed from each observation's combined duration, rather than by adding separate medians. Readiness spans the POST request through repository resolution, VM setup and envd readiness until the public launch response returns. The first checksum is a separate API/guest-command measurement after that response.
+
+The historical raw label `warm` means **first restore after saving, without explicit eviction**. It does not establish equal or complete page residency. There was no complete untimed restore before that endpoint, and input memory-file residency was not recorded before it. Consequently this is a whole-implementation, post-save behavior comparison. It cannot by itself isolate a reader regression or establish a fully cached comparison. The targeted-cold endpoint separately evicts snapshot files and verifies memory-layer residency at most 5%; metadata/process caches remain normal. Both original acceptance margins remain unchanged.
+
+Generation count and layer count also differ. The retained first pair has two original memory layers versus 33 candidate layers after 96 captures. This is an output of cumulative versus incremental storage and compaction, not a different generation-count input. Only the first pair's repositories were retained, so this measured layer count is not claimed for all 30 pairs. More layers can add file-open, index and fragmented-read work; the observed latency ratio does not prove which component caused it. The two separately running guests also have independent CPU/device/OS state despite identical seeds and payload checksums.
+
+Host load and placement were not isolated: the protocol uses default CPU/NUMA placement on the shared Intel host. Randomized pairing reduces order bias but does not guarantee identical cache or scheduling conditions. The earlier fixed-byte, explicitly prewarmed layout controls and ARM controls with a common debug API server answer different questions; their times are not pooled with this primary matrix or substituted for its endpoints.
+
+The frozen analyzer differs from the later published analyzer only by the addition of exported `paired_measurements`. Its quantile and bootstrap function ASTs are identical; all saved statistics were reproduced. [Frozen protocol, analyzer and audit](formal4-control-audit.json.gz) preserve this distinction. No new performance experiment was started during this audit.
 
 ## Space and retention boundary
 
@@ -219,6 +253,8 @@ The preceding `9b99228` formal2 candidate completed 30 pairs each for idle, rota
 - [Long-chain first-restore reader control](reader-long.json.gz) and [explicitly prewarmed control](reader-long-prewarmed.json.gz)
 - [Additional ARM reader controls, candidate patches and harness sources](reader-controls-arm.json.gz)
 - [Observed ARM request geometry, synthetic mappings and metadata attribution](reader-geometry-arm.json.gz)
+- Completed [4 GiB rotating](formal4-4096-rotating.json.gz), [4 GiB dense](formal4-4096-dense.json.gz) and [96-generation rotating](formal4-long.json.gz) cells
+- [Frozen-program control and endpoint audit](formal4-control-audit.json.gz)
 
 Follow [the benchmark preparation guide](../../../scripts/benchmarks/README.md) to regenerate fresh seeds and trials. Run each case independently with its fixed pair count. Preserve every protocol and failed/incomplete sample. Exact current runtime hashes are above.
 
@@ -229,17 +265,19 @@ python3 - <<'PYCODE'
 import gzip, json, math, sys
 sys.path.insert(0, 'scripts/benchmarks')
 from analyze_clear_comparison import ratios
-path = 'docs/experiments/clear-memory-20261108/formal3-idle.json.gz'
-report = json.load(gzip.open(path, 'rt'))
-for index, workload in enumerate(report['workloads']):
-    pairs = workload['paired_measurements']
-    for metric, saved in workload['metrics'].items():
-        recalculated = ratios([(p['baseline'][metric], p['candidate'][metric]) for p in pairs],
-                              report['bootstrap_iterations'], 20261107 + index)
-        for statistic in ('p50', 'p95', 'mean'):
-            for field in ('ratio', 'upper_95_one_sided'):
-                assert math.isclose(recalculated[statistic][field], saved[statistic][field],
-                                    rel_tol=1e-12, abs_tol=1e-12)
+for name in ('formal3-idle', 'formal4-idle', 'formal4-rotating', 'formal4-hotspot',
+             'formal4-dense', 'formal4-4096-rotating', 'formal4-4096-dense', 'formal4-long'):
+    path = f'docs/experiments/clear-memory-20261108/{name}.json.gz'
+    report = json.load(gzip.open(path, 'rt'))
+    for index, workload in enumerate(report['workloads']):
+        pairs = workload['paired_measurements']
+        for metric, saved in workload['metrics'].items():
+            recalculated = ratios([(p['baseline'][metric], p['candidate'][metric]) for p in pairs],
+                                  report['bootstrap_iterations'], 20261107 + index)
+            for statistic in ('p50', 'p95', 'mean'):
+                for field in ('ratio', 'upper_95_one_sided'):
+                    assert math.isclose(recalculated[statistic][field], saved[statistic][field],
+                                        rel_tol=1e-12, abs_tol=1e-12)
 print('Paired ratios reproduced')
 
 controls = json.load(gzip.open('docs/experiments/clear-memory-20261108/reader-controls-arm.json.gz', 'rt'))
