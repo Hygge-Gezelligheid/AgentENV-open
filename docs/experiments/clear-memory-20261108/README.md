@@ -147,6 +147,8 @@ A read-only post-hoc audit of all 60 long-chain trials matched the source VM and
 
 The source's initial-resume-to-final-capture-pause interval had medians 154.732/56.805 seconds. This includes earlier capture pauses and is not guest CPU time. It confirms that equal generation counts do not equalize the source's elapsed history. That difference is an outcome of the whole workflow, not proof of a reader defect. A fixed complete VM-state input is still necessary for attribution. [The audit bundle](formal4-control-audit.json.gz) includes every derived row and the derivation source; original numeric measurements, analysis and acceptance gates are unchanged.
 
+Subsequent input/build preparation verified all 536870912 logical memory bytes between the retained 33-layer image and a flattened single layer, preserving the saved VM-state files. Two reader builds share 872 source files with exactly two differences (local.rs, readonly.rs), matching compiler settings, release profiles and io-uring features. The initial shared-target build attempt copied identical binaries and was rejected before any trial. Source timestamp refresh plus Cargo JSON checks required the library and executable to be rebuilt and supplied the actual executable paths. The accepted binary hashes reproduce the original frozen formal4 baseline/current readers exactly. All attempts, build manifests and preparation sources are retained in the existing audit bundle. This prepares controlled inputs only: no VM or performance trial was launched, and actual spawn/cache preflight remains mandatory.
+
 ## Space and retention boundary
 
 Space counts repository logical bytes and allocated node/work/serial bytes, deduplicating hard links by device/inode. Growth subtracts seeded input state and includes the running source's private baseline. Common binaries and fixed dependency images are excluded. The measured filesystem is ext4. The separate transient control runtime directories contained no regular files in the completed batch; writable device data lives under the counted work directories.
@@ -359,7 +361,7 @@ The design is reader {baseline, current} x memory layout {33 layers, flattened},
 
 Keep two separately named file-cache profiles: referenced local files resident (>=99% verified), and targeted memory files cold (<=5% verified). File warming, not an untimed target restore, prepares the first profile. Rootfs/tools preparation must match across all four cells. Both profiles measure the first target open in the fresh node; neither is equated with A's post-save or after-warm-restore cache state. A later repeated-device/index-hot observation would be another endpoint.
 
-Freeze all timing boundaries and placement rules before execution. Report readiness, checksum and their observed combined duration independently. If a tracing/profiling tool is used, its cohort is diagnostic and its perturbed times are excluded from uninstrumented estimates.
+Freeze all timing boundaries and placement rules before execution. A new attribution driver must record monotonic durations and wall-clock alignment brackets at request start and complete-response readiness for every variant; these fields do not retroactively redefine the original endpoints. Report readiness, checksum and their observed combined duration independently. If a tracing/profiling tool is used, its cohort is diagnostic and its perturbed times are excluded from uninstrumented estimates.
 
 ### Preflight and reporting
 
