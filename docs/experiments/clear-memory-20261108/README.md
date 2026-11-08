@@ -11,15 +11,15 @@ GET/CLEAR errors, cancellation and ambiguous responses poison dirty tracking and
 The read changes are confined to OverlayBD:
 
 - Independent mapped fragments read into disjoint destination slices, with at most 32 in flight. All borrowed-buffer operations drain before propagating an error. The production read implementation has fewer lines than the original serial loop.
-- Buffered contextual reads first try `preadv2(RWF_NOWAIT)`. A complete cache hit returns immediately. Misses, partial reads, EOF and errors use the original full-range asynchronous read. Unsupported operation is remembered per open file. This adds roughly thirty production lines, one atomic flag and a focused real io-uring regression; no data cache, extra copy buffer or configuration.
+- Buffered contextual reads first try `preadv2(RWF_NOWAIT)`. A complete cache hit returns immediately. Positive partial hits retain their copied prefix and asynchronously read only the remaining tail. Misses and zero-length results use the original full-range asynchronous read. Unsupported operation is remembered per open file. This adds roughly forty production lines, one atomic flag and a focused real io-uring regression; no data cache, extra copy buffer or configuration.
 
 The code audit also removed repeated disk-layer adoption and repeated parent hashing. Rootfs/drive sealed files have one live owner; captures obtain independent links or sparse copies. An index-rewrite prototype, coalescing prototype and 4 KiB-only NOWAIT alternative were measured and removed because they did not improve the relevant end-to-end behavior.
 
-The five handwritten runtime files have a net increase of 190 lines before their independent `cfg(test)` modules: client +27, snapshot helpers +42, sandbox lifecycle +100, LocalFile +31 and mapped reads -10. Counts include comments and blank lines. The baseline ownership and failure state belong to the capture lifecycle; the reader changes stay in OverlayBD.
+The five handwritten runtime files have a net increase of 201 lines before their independent `cfg(test)` modules: client +27, snapshot helpers +42, sandbox lifecycle +100, LocalFile +42 and mapped reads -10. Counts include comments and blank lines. The baseline ownership and failure state belong to the capture lifecycle; the reader changes stay in OverlayBD.
 
 ## Fixed programs and environment
 
-Original upstream baseline: `05323abea960ab9348208d774c320d3782651544`. Current runtime code: `367b29fcf989fa7a0ffcc65564451f7be6b280a1`; all 21 changed files matched the source manifest before measurement. Later report/export changes do not alter those runtime binaries. Earlier results explicitly identify the preceding `9b99228` candidate.
+Original upstream baseline: `05323abea960ab9348208d774c320d3782651544`. Frozen confirmation runtime code: `367b29fcf989fa7a0ffcc65564451f7be6b280a1`; all 21 changed files matched the source manifest before measurement. Later report/export changes do not alter those runtime binaries. Earlier results explicitly identify the preceding `9b99228` candidate.
 
 | Program | SHA-256 |
 | --- | --- |
@@ -330,6 +330,27 @@ Eleven of twelve reader/endpoint contrasts meet the diagnostic 5%/10% upper-rati
 
 After the frozen cohort, the different-layer test is strengthened so its numeric physical offsets are contiguous across the layer boundary; the tag is then independently necessary to prevent merging. The strengthened test, 17 snapshot units, formatting and workspace checks pass, with the existing ARM test-import exception stated earlier. Rebuilt reader and native programs are byte-identical to those used for timing and native validation. This test-only revision does not alter or retake measurements. Exact patches, both source revisions, raw rows, preflight/admission, full input hashes, native summaries, independent verification and runnable sources are retained under `fixed_state_index_coalescing_arm_20261109` in the existing audit archive. Full guest memory and full run logs remain private.
 
+## Positive NOWAIT prefix read
+
+Code review commit `6fae1868e4ef6a238df97aa2cd35e3d6d1a81f42` changes only the already-modified `storage/overlaybd/src/backend/local.rs`. A positive short NOWAIT result previously fell through to a full-range asynchronous reread. The new branch keeps those bytes and reads only the remaining tail. Complete cache hits, zero-result misses, unsupported-operation fallback and direct I/O retain their paths. There is no new helper, configuration, Rust file or Markdown file.
+
+The existing ignored io-uring regression now changes a synthetic file prefix in the runtime's submission hook, after NOWAIT has copied it and before the asynchronous request reaches the kernel. Before the fix the copied prefix is overwritten and the new assertion fails; after the fix the original prefix, returned count and untouched EOF tail are preserved. The test explicitly requires filesystem NOWAIT support. All 408 storage units pass (four ignored), the explicit cached/fallback check passes, and formatting plus strict changed-crate all-target/all-feature Clippy pass.
+
+A separate **non-timed** probe traces the current reader, before the fix, on the same full 96-generation ARM snapshot used above. It holds the API/runtime/kernel/dependencies fixed, verifies complete residency or targeted eviction, and checks actual program UID/hash, the guest checksum, unchanged layer hashes and cleanup. `strace -v -s0` preserves request lengths while suppressing buffer contents. Only numeric lengths, results and error codes are exported; full traces stay private.
+
+| Current reader input | NOWAIT calls | Positive partial calls | Prefix bytes that the old fallback reads again |
+| --- | ---: | ---: | ---: |
+| 33 layers, resident | 5410 | 0 | 0 |
+| 33 layers, targeted cold | 5411 | 60 | 7,305,216 |
+| One layer, resident | 5107 | 0 | 0 |
+| One layer, targeted cold | 5104 | 54 | 4,872,192 |
+
+An independent parser reconstructs all four sets of counts from 21,032 numeric call records. This establishes that positive partial reads occur in real cold recovery; it does **not** attribute the original 20.51% post-save readiness gap to them. No positive partial read occurs in the two fully resident probes. These are four instrumented observations, with no latency endpoints, confidence intervals or performance-acceptance decision. The initial abbreviated-iovec setup lacks lengths and is retained separately, not counted in this table.
+
+The final source, including the clarified test prerequisite, is frozen and checked against all 872 local source files. New native programs and the actual corrected reader pass 17 snapshot units (one ignored), CLEAR faults and all five incremental integrations including 96 restores. Complete memory comparisons pass for 36 generations at each of 512 MiB and 4 GiB: 72 comparisons across real compaction boundaries. Actual native program hashes and UID are checked and all captured owned processes exit. Reader hash: `e38aa78a286fb7e9a3182ed4f1970e35ebd6c11357e924e30353df465726a050`.
+
+Exact patches, source/build manifests, numeric calls, independent verifier and native summaries are in `partial_nowait_tail_read_20261109` in the existing audit archive. Original confirmation binaries, observations, gates and six failing latency cells remain unchanged. No new latency cohort is run for this commit.
+
 ## Space and retention boundary
 
 Space counts repository logical bytes and allocated node/work/serial bytes, deduplicating hard links by device/inode. Growth subtracts seeded input state and includes the running source's private baseline. Common binaries and fixed dependency images are excluded. The measured filesystem is ext4. The separate transient control runtime directories contained no regular files in the completed batch; writable device data lives under the counted work directories.
@@ -591,6 +612,23 @@ with tempfile.TemporaryDirectory() as directory:
     result = json.loads((root / 'independent-validation.json').read_text())
     assert result['complete'] and result['statistic_fields_checked'] == 288
     assert result['max_absolute_error'] <= 1e-12
+PYCODE
+```
+
+To independently verify the positive-prefix numeric calls and correctness receipts:
+
+```bash
+python3 - <<'PYCODE'
+import gzip, json, pathlib, subprocess, sys, tempfile
+bundle = json.load(gzip.open('docs/experiments/clear-memory-20261108/formal4-control-audit.json.gz', 'rt'))
+data = bundle['partial_nowait_tail_read_20261109']
+with tempfile.TemporaryDirectory() as directory:
+    root = pathlib.Path(directory)
+    raw = root / 'results.json'
+    raw.write_text(json.dumps(data))
+    script = root / 'verify.py'
+    script.write_text(data['numeric_verifier_source'])
+    subprocess.run([sys.executable, str(script), str(raw)], check=True)
 PYCODE
 ```
 
