@@ -547,6 +547,16 @@ pub(super) async fn build_mem_snapshot_image_config(
     )
     .await?;
 
+    if new_layer_path.starts_with(output_dir)
+        && !lowers
+            .iter()
+            .any(|lower| Path::new(&lower.file) == new_layer_path)
+    {
+        tokio::fs::remove_file(new_layer_path)
+            .await
+            .context("remove compacted raw memory export")?;
+    }
+
     Ok(ImageConfig {
         repo_blob_url: inherited_image_config.repo_blob_url,
         lowers,
@@ -1297,6 +1307,10 @@ mod tests {
             .unwrap();
             if capture.path().join("mem_compacted.commit").exists() {
                 compactions += 1;
+                assert!(
+                    !delta.exists(),
+                    "compaction retained the unpublished raw export"
+                );
             }
             let path = capture.path().join("image.json");
             fs::write(&path, serde_json::to_vec(&image).unwrap()).unwrap();

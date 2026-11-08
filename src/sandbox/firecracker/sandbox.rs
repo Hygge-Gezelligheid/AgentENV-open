@@ -2776,7 +2776,9 @@ mod tests {
         let mut sandbox = clear_test_sandbox(memory_mib).await?;
         let store = tempfile::tempdir()?;
         let result = async {
-            for generation in 0..4 {
+            let mut compactions = 0;
+            // Cross the 32-layer suffix limit after the generation-one restart.
+            for generation in 0..36 {
                 let command = match generation {
                     0 => "head -c 16777216 /dev/zero | tr '\\000' '\\125' > /run/oracle",
                     1 => "dd if=/dev/zero of=/run/oracle bs=1048576 count=4 conv=notrunc status=none",
@@ -2787,6 +2789,13 @@ mod tests {
                 anyhow::ensure!(output.exit_code == 0, "oracle write failed: {}", output.stderr);
                 let directory = store.path().join(generation.to_string());
                 let (snapshot, _) = sandbox.pause_to_dir(&directory).await?;
+                if directory.join("mem_compacted.commit").exists() {
+                    compactions += 1;
+                    anyhow::ensure!(
+                        !directory.join("mem_overlaybd/overlaybd.commit").exists(),
+                        "compaction retained the unpublished raw export"
+                    );
+                }
                 let regions = sandbox.fc_instance.guest_memory_regions_for_test().await?;
                 let reader = ProcessVmReader::new(sandbox.fc_instance.pid()?);
                 let image = overlaybd::config::load_image_config(&snapshot.mem_overlaybd_config.image_config_path)?;
@@ -2820,6 +2829,7 @@ mod tests {
                     sandbox.resume().await?;
                 }
             }
+            anyhow::ensure!(compactions > 0, "full-memory oracle did not cross compaction");
             Ok(())
         }.await;
         sandbox.stop().await?;
