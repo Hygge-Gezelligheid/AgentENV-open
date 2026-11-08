@@ -38,6 +38,8 @@ Guests use kernel 6.18, 2 vCPUs, envd 0.5.15, tools 0.1.1 and a prepared public 
 
 ## Protocol and unchanged acceptance
 
+[Comparison contract](COMPARISON-CONTRACT.md) defines the controls for subsequent whole-implementation and reader/layout studies. It preserves the original endpoints and gates, separates cache profiles, and distinguishes incremental export bytes from periodic compaction rewrites. No new trials were started while preparing it.
+
 Trials run serially in randomized within-pair order. Each pair has fresh repositories, catalogs, API processes and runtime state, matching server/daemon builds, and identical immutable seeds. The source VM remains running during restore measurements. Input hashes and order are frozen before a batch. Setup, workload writes and checksum checks precede save timing; the first checksum after restore is itself a timed endpoint.
 
 The tmpfs payload is half of guest RAM. Rotating/hotspot writes change 1% of RAM per generation; dense replaces the payload; idle performs no payload writes. Eight-generation cells cover 512 MiB idle/rotating/hotspot/dense and 4096 MiB rotating/dense. The long chain uses 512 MiB rotating for 96 generations.
