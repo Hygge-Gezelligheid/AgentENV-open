@@ -245,6 +245,22 @@ Rust 1.99.1 checks pass: 17 snapshot-module unit tests (one cross-filesystem tes
 
 Two preparation failures are retained separately: the first isolated unit environment lacked the storage-service configuration; the first integration attempt lacked the image-conversion configuration before entering the capture loop. The corrected environments use the same frozen test binaries and unchanged test bodies. This integration correctness test uses its existing registry-image setup, so its elapsed time is not performance evidence. No acceptance cohort has started for this candidate. ARM and the original seven workload cells remain outstanding, with counts and gates unchanged. The single-file patch, source/build identities, harness sources and native receipts are embedded under `memory_layer_budget_candidate_20261109` in the existing audit archive.
 
+## Memory suffix policy pilot, no acceptance inference
+
+This completed pilot compares **core `955be00` with suffix 32** against the isolated **suffix 4** patch, with the same frozen E345 reader. The control is not original upstream `05323`. Both servers were freshly built from the same 872-file archive with identical compiler, lockfile, features and profiles; exactly one existing source file differs. The pilot was fixed at one randomized pair in each of three workloads. All six complete observations, expected generation counts, matching payload checksums, canonical configurations, actual process UID/hash/path checks and targeted-cold residency <=5% passed. Final program/script and shared 64 GiB tools hashes are unchanged; no observations were excluded or retried.
+
+The initial attempt stopped before workload setup because its verifier incorrectly required a single Firecracker process; it contains zero save/restore samples and is retained. An untimed two-group audit found one configured two-vCPU VM plus four preboot pool processes in each group, all verified and cleaned up. Both original `05323` and core `955be00` have the same enabled Firecracker-pool defaults. The original whole-implementation runner disables network/block pools but omits `pool.firecracker`; its historical live pool occupancy was not recorded. The new pilot preserves that configuration and strictly verifies the same one-running/four-preboot state in both groups before workload setup. This differs from the explicitly pool-disabled fixed-state reader studies; their data remain separate.
+
+The workload, timing and space source is byte-identical to frozen `clear_api_trial.py` (`f65c9b4`). The new runner adds only pre-workload process verification and post-run metadata checks. Analysis reuses the original frozen metric-extraction body and quantile function (`2c5892f`); an independent raw-row reconstruction matches all 252 summary values. Values below are descriptive: each workload has only one independent pair, so there are no confidence intervals or acceptance decisions. Columns show suffix 32 control / suffix 4 candidate.
+
+| Workload | Final memory layers | Chain save seconds | Pause upper p95 ms | Post-save ready ms | Candidate/control repository bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 512 MiB idle, 8 captures | 9 / 5 | 0.629 / 0.681 | 42.728 / 61.592 | 322.812 / 266.461 | 1.064 |
+| 512 MiB rotating, 96 captures | 33 / 5 | 14.669 / 26.726 | 89.968 / 420.192 | 370.617 / 316.863 | 2.516 |
+| 4096 MiB dense, 8 captures | 9 / 5 | 37.903 / 40.705 | 1977.839 / 3475.250 | 407.394 / 417.404 | 1.014 |
+
+The long input has the predicted 33/5 physical layers. Its lower readiness accompanies substantially more compaction: chain save time increases from 14.669 to 26.726 seconds and pause upper p95 from 89.968 to 420.192 ms; repository bytes are 2.516 times the suffix 32 control. The four-layer policy is therefore not retained as-is. Source inspection confirms memory compaction currently runs before CLEAR/resume; moving work on immutable memory files after resume is a prospective implementation change requiring fresh correctness and performance checks. This pilot does not establish space or latency relative to the original implementation, replace any failed formal4 endpoint, or change the original seven-cell gates. All raw numbers, build/source manifests, configurations, zero-sample failure, pool preflight and analysis source are embedded under `memory_suffix_policy_pilot_20261109` in the existing audit archive. Code PR #5 remains unchanged.
+
 ## Space and retention boundary
 
 Space counts repository logical bytes and allocated node/work/serial bytes, deduplicating hard links by device/inode. Growth subtracts seeded input state and includes the running source's private baseline. Common binaries and fixed dependency images are excluded. The measured filesystem is ext4. The separate transient control runtime directories contained no regular files in the completed batch; writable device data lives under the counted work directories.
@@ -465,6 +481,26 @@ with tempfile.TemporaryDirectory() as directory:
     script.write_text(study['sources']['analyze-first-read-cpu.py'])
     subprocess.run([sys.executable, str(script), '--pmu', str(root)], check=True)
     assert json.loads((root / 'analysis.json').read_text()) == study['analysis']
+PYCODE
+```
+
+To reproduce the memory suffix policy pilot's metric extraction and descriptive summaries:
+
+```bash
+python3 - <<'PYCODE'
+import gzip, json, pathlib, subprocess, sys, tempfile
+bundle = json.load(gzip.open('docs/experiments/clear-memory-20261108/formal4-control-audit.json.gz', 'rt'))
+study = bundle['memory_suffix_policy_pilot_20261109']
+with tempfile.TemporaryDirectory() as directory:
+    root = pathlib.Path(directory)
+    raw = root / 'pilot-v2-results.json'
+    raw.write_text(json.dumps(study['complete_results']))
+    frozen = root / 'frozen-analyzer.py'
+    frozen.write_text(bundle['frozen_analyzer'])
+    script = root / 'analyze-memory-budget-pilot.py'
+    script.write_text(study['sources']['analyze-memory-budget-pilot.py'])
+    subprocess.run([sys.executable, str(script), str(raw), str(frozen)], check=True)
+    assert json.loads((root / 'pilot-v2-analysis.json').read_text()) == study['analysis']
 PYCODE
 ```
 
