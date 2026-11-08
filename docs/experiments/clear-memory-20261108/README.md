@@ -15,7 +15,7 @@ The read changes are confined to OverlayBD:
 
 The code audit also removed repeated disk-layer adoption and repeated parent hashing. Rootfs/drive sealed files have one live owner; captures obtain independent links or sparse copies. An index-rewrite prototype, coalescing prototype and 4 KiB-only NOWAIT alternative were measured and removed because they did not improve the relevant end-to-end behavior.
 
-The five handwritten runtime files have a net increase of 180 lines before their independent `cfg(test)` modules: client +27, snapshot helpers +32, sandbox lifecycle +100, LocalFile +31 and mapped reads -10. Counts include comments and blank lines. The baseline ownership and failure state belong to the capture lifecycle; the reader changes stay in OverlayBD.
+The five handwritten runtime files have a net increase of 190 lines before their independent `cfg(test)` modules: client +27, snapshot helpers +42, sandbox lifecycle +100, LocalFile +31 and mapped reads -10. Counts include comments and blank lines. The baseline ownership and failure state belong to the capture lifecycle; the reader changes stay in OverlayBD.
 
 ## Fixed programs and environment
 
@@ -303,6 +303,33 @@ All 872 local source files match the exact ARM build/test manifest. Before the p
 
 Intel is unavailable during this follow-up. Its earlier correctness and original performance results remain historical evidence for their frozen source; they are not relabeled as executions of the new commit. Original latency acceptance and exact allocated-byte attribution remain unestablished, and no new confirmation cohort is run. This commit resolves a directly reproduced file-lifetime defect while leaving the original acceptance requirements open.
 
+## Immutable-index coalescing, exact controls
+
+An isolated candidate adds one call to the existing `compress_raw_index` after zero normalization in `ReadOnlyIndex::new`. It merges adjacent logical/physical ranges from the same layer once when building the immutable index. Mutable index replay, file format and ordered layer references are unchanged. The constructor is shared by single-file opening, multi-layer merging and premerged artifact loading, avoiding repeated work in every read. This touches one existing index module and extends the existing storage test file; it adds no Rust or Markdown file.
+
+The new observable regression fails before the call: four contiguous mappings cause four underlying reads instead of one. After the call, contiguous data uses one read; physical gaps, logical holes, different layer tags and explicit zero extents retain the required two reads. All five cases also verify contents, partial ranges and EOF destination tails. The complete OverlayBD suite passes 409 tests with four ignored; the explicit io-uring cached-read/fallback check, formatting and strict crate all-target/all-feature Clippy pass. New frozen native programs with the candidate reader pass 72 complete memory comparisons across real compaction boundaries, CLEAR faults and all five integrations including 96 captures/restores and earlier-capture deletion.
+
+Both ARM release readers are built in the **same source directory**, before and after the one-line production change, with identical Rust 1.99.1, flags, features (`default`, `full`, `io-uring`) and profiles (opt3, debug0). The control is the current code review's reader at `8b330eb`, not original upstream `05323`. Control/candidate hashes are `b1f4d67a2073ac89509071c60abe9a73317a92d22105409c001c5fce514f2c79` / `0c4f80d041d5ce7764eb2c28f325121afbfd541f102451488850aaff94dba1cd`.
+
+A single ARM rotating/96-capture fixture has 33 memory layers. A reference-library tool checks every 536,870,912 logical byte against its flattened representation; both have virtual SHA-256 `3f6cc95f6fc502ff3463c986a3cbe8afe1e127532e23dc74cbcb5c6209106878`. The flat blob is 347,570,176 bytes with digest `sha256:c9b9307a09ef94b167d31cf42cb01bb5bc9bf5148fdcdd9406d6a593eee24f61`. The same snapshot ID, full VM state and all other record fields are preserved; only `committed.memory_layers` changes. All 217 other nonmanaged repository files are byte-identical. Structural counts show the existing compacted lower can reduce from 3210 to 539 mappings, the merged index from 4065 to 3755, and the flattened index from 3755 to 71. These are structural observations, not latency estimates. Fixture preparation timings are excluded from comparisons.
+
+The same frozen driver first passes all eight reader/layout/cache combinations without recording latency endpoints. Actual process UID/hash/path, one configured two-vCPU VM, canonical configurations, payload, cleanup and before/after input hashes (including the 64 GiB tools image) match. All three pools are explicitly disabled in both groups. Resident trials perform the same untimed target restore/checksum prelude, then read every target memory-file byte and verify 100% residency. Cold trials perform that same prelude, then use the existing targeted eviction and verify memory residency at most 5%. Every measured case uses a fresh node. Program-identity checks occur outside the create-response and first-checksum clocks.
+
+The prospective comparison is fixed at 30 complete randomized eight-cell blocks (two readers, two layouts, two cache profiles), 240 measured restores, seed `2026110902`. It uses one common debug API server, the same kernel/Firecracker/dependencies and identical saved state. Legacy ARM helper hashes are recorded explicitly; they differ from formal4 helpers and are not pooled with them. Original frozen quantile and paired whole-block bootstrap functions are reused with 10000 resamples. The study attributes reader/layout effects on ARM; it cannot replace original seven-cell confirmation or establish whole-lifecycle space/pause/save performance.
+
+All 240 observations finish with every cache/configuration/program/payload/cleanup check passing and all final input hashes unchanged. No observation is retried or excluded. An independent parser reconstructs all 24 reader/layout contrasts and 288 point/confidence fields within `1e-12` (maximum absolute error `4.44e-16`). Values below compare the current reader against the one-line candidate on the **same fixed ARM input**; they are not original-versus-CLEAR confirmation values.
+
+| Layout/cache | Ready median ms, control / candidate | First checksum median ms, control / candidate | First-checksum p50 ratio upper | First-checksum p95 ratio upper |
+| --- | ---: | ---: | ---: | ---: |
+| 33 layers, resident | 269.879 / 265.045 | 380.876 / 377.102 | 1.0072 | 1.0198 |
+| 33 layers, targeted cold | 946.799 / 935.037 | 1180.678 / 1174.387 | 1.0095 | 1.0232 |
+| One layer, resident | 276.184 / 268.512 | 396.216 / 392.277 | 1.0061 | 1.0244 |
+| One layer, targeted cold | 577.102 / 566.232 | 482.504 / 496.607 | 1.0437 | **1.1083** |
+
+Eleven of twelve reader/endpoint contrasts meet the diagnostic 5%/10% upper-ratio gates. Cold one-layer first checksum does not establish tail noninferiority: its p50 point ratio is 1.0292, p95 point ratio 1.0252, and p95 one-sided 95% upper ratio 1.1083 exceeds 1.10. The upper bound is not an observed 10.8% slowdown. Cold one-layer combined median is 1063.691 / 1060.614 ms, but that cannot waive a separate first-checksum endpoint. Readiness improves modestly; the candidate is not adopted in code PR #5, which remains nine existing paths at `8b330eb`. No gates or sample counts are changed and no replacement cohort is run. Original confirmation remains unmet.
+
+After the frozen cohort, the different-layer test is strengthened so its numeric physical offsets are contiguous across the layer boundary; the tag is then independently necessary to prevent merging. The strengthened test, 17 snapshot units, formatting and workspace checks pass, with the existing ARM test-import exception stated earlier. Rebuilt reader and native programs are byte-identical to those used for timing and native validation. This test-only revision does not alter or retake measurements. Exact patches, both source revisions, raw rows, preflight/admission, full input hashes, native summaries, independent verification and runnable sources are retained under `fixed_state_index_coalescing_arm_20261109` in the existing audit archive. Full guest memory and full run logs remain private.
+
 ## Space and retention boundary
 
 Space counts repository logical bytes and allocated node/work/serial bytes, deduplicating hard links by device/inode. Growth subtracts seeded input state and includes the running source's private baseline. Common binaries and fixed dependency images are excluded. The measured filesystem is ext4. The separate transient control runtime directories contained no regular files in the completed batch; writable device data lives under the counted work directories.
@@ -544,6 +571,26 @@ for namespace in ['memory_suffix_policy_pilot_20261109', 'post_resume_original_p
         script.write_text(study['sources']['analyze-memory-budget-pilot.py'])
         subprocess.run([sys.executable, str(script), str(raw), str(frozen)], check=True)
         assert json.loads((root / 'pilot-v2-analysis.json').read_text()) == study['analysis']
+PYCODE
+```
+
+To independently reproduce the complete ARM coalescing control's paired statistics:
+
+```bash
+python3 - <<'PYCODE'
+import gzip, json, pathlib, subprocess, sys, tempfile
+bundle = json.load(gzip.open('docs/experiments/clear-memory-20261108/formal4-control-audit.json.gz', 'rt'))
+study = bundle['fixed_state_index_coalescing_arm_20261109']
+with tempfile.TemporaryDirectory() as directory:
+    root = pathlib.Path(directory)
+    raw = root / 'results.json'
+    raw.write_text(json.dumps(study['results']))
+    script = root / 'verify-coalescing-control.py'
+    script.write_text(study['sources']['verify-coalescing-control.py'])
+    subprocess.run([sys.executable, str(script), str(raw)], check=True)
+    result = json.loads((root / 'independent-validation.json').read_text())
+    assert result['complete'] and result['statistic_fields_checked'] == 288
+    assert result['max_absolute_error'] <= 1e-12
 PYCODE
 ```
 
