@@ -739,3 +739,69 @@ set `AENV_BENCH_FULL=1` for Criterion. `AENV_BENCH_CONCURRENCY` defaults to twic
 the available CPU parallelism, up to 50. A failed operation fails the batch;
 the benchmark attempts to stop any remaining sandboxes and reports cleanup
 errors.
+
+## Consecutive incremental memory captures
+
+KVM captures with dirty-page tracking require Firecracker's
+`PUT /vm/dirty-memory-ranges/clear` endpoint. Within one pause window, AgentENV
+saves CPU/device state, exports dirty memory, completes the matching local
+snapshot, and retains an independently owned memory baseline before CLEAR.
+The source resumes before repository publication, as in ordinary capture.
+Publication failure does not release the baseline needed by the next capture.
+This private baseline belongs to the live instance; process or host recovery
+uses committed repository snapshots. Keeping it does not add a second data
+flush to the pause window.
+
+Each subsequent memory layer contains pages dirtied since the preceding
+successful CLEAR, including explicit zero writes and conservatively dirty
+virtio queue pages. The image config includes the complete parent chain.
+Existing layer-budget compaction can combine historical updates into a new
+layer; stable base layers keep their separate compaction boundary. OverlayBD
+reads the merged index and overlaps up to 32 independent mapped reads into
+disjoint caller-buffer slices. It drains these reads before returning an error.
+
+GET/CLEAR failures or timeouts can leave partially consumed KVM logs. AgentENV
+classifies these as terminal capture failures and stops the affected instance.
+Restore a committed snapshot in a replacement instance. With dirty tracking
+disabled, capture retains the existing residency-based behavior.
+
+Live disk runtimes retain uniquely named sealed uppers in their own directories;
+captures own independent links or copies. Removing a capture directory must not
+invalidate a running source or a later snapshot.
+
+The focused real-guest regression uses 96 consecutive captures, host-computed
+RAM hashes, explicit zero overwrites, source termination, restoration of every
+generation, and restoration after earlier capture directories are deleted:
+
+```bash
+cargo test -p agentenv --lib memory_baseline
+cargo test -p agentenv --lib clear_dirty_memory
+cargo test -p agentenv --lib unreliable_memory_tracking
+scripts/run-with-capabilities.sh cargo test -p agentenv --test integration \
+  clear::consecutive_captures -- --ignored --nocapture --test-threads=1
+```
+
+Use isolated state, runtime, and dependency directories as described above.
+`AENV_CLEAR_TEST_IMAGE_CONFIG` can select a prepared local public image for this
+regression; otherwise it resolves the standard integration-test image.
+
+Additional isolated regressions cover complete 512 MiB and 4 GiB guest-memory
+byte comparison, CLEAR response rejection/loss/timeouts, publication failure, fork and encoded
+pause recovery, and fresh POSIX/OSS repository caches:
+
+```bash
+scripts/run-with-capabilities.sh cargo test -p agentenv --lib \
+  clear_snapshot_matches_complete -- --ignored --nocapture --test-threads=1
+scripts/run-with-capabilities.sh cargo test -p agentenv --lib \
+  clear_failure_or_lost_response_never_resumes_instance -- --ignored --nocapture
+scripts/run-with-capabilities.sh cargo test -p agentenv --test integration \
+  clear:: -- --ignored --nocapture --test-threads=1
+```
+
+The OSS fresh-cache case uses `AENV_CLEAR_OSS_ENDPOINT`, an isolated
+`clear-api-test` bucket with the standard local MinIO fixture credentials,
+and matching OSS settings in the ublk memory/rootfs global configurations.
+Use only a disposable local test service. Without that variable the same case
+runs against POSIX storage. The suite also exercises tracking disabled and
+captures while atomic tmpfs/ext4 file replacement runs continuously.
+
