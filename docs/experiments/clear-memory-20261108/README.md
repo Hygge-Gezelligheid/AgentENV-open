@@ -151,7 +151,32 @@ Subsequent input/build preparation verified all 536870912 logical memory bytes b
 
 Eight subsequent **untimed** direct-target checks passed: two readers x two layouts x two cache profiles. Actual API/daemon/Firecracker processes ran as ubuntu and matched the frozen executable hashes. Both layouts restored the same payload checksum with both readers. Memory-file residency immediately before target open was 100% for resident cases and 0% for targeted-cold cases; captured owned processes had terminated after cleanup. Every node used fresh state and explicitly disabled network, block and Firecracker process pools. The initial check failed before restore because a test-only work path exceeded the Unix socket path limit; it is retained, and the corrected attempt used short task-specific paths. These are correctness/control checks, not timing results or a replacement for the six failed formal latency cells.
 
-The installed raw tools drive is 64 GiB and fully allocated. The next unified driver will use the plan's permitted identical untimed seed launch/delete to initialize the daemon/tools path in every fresh node, while keeping the measured target's first open. That exact prelude still needs its own untimed check before the randomized cohort. No new timing cohort has started. The existing audit bundle contains the eight receipts and exact preflight sources; the draft timing driver remains private until validated and frozen.
+The subsequent unified driver used the plan's identical untimed seed launch/delete in every fresh node to initialize the daemon/tools path while keeping the target's first open. All eight exact-driver preflight cases passed. The 64 GiB raw tools file was hashed before and after each full batch, rather than reread completely before every observation. The completed prospective reader/layout cohort follows below.
+
+## Prospective fixed-state reader/layout diagnosis
+
+This separately declared B cohort completed **30 randomized complete blocks per cache profile, 240 observations total**, with no failed, retried or excluded observations. Both readers restore the same saved 512 MiB VM state with byte-equivalent 33-layer and flattened single-layer memory. The common API server is the current `674a724a...` binary; baseline/current daemons are `741c0b3f...`/`e345d97e...`. This isolates reader/layout factors and does not replace the whole-implementation A study.
+
+Each observation has a fresh node/API/daemon and the same untimed seed prelude. Network, block and Firecracker pools are disabled. Rootfs/state/kernel/program file preparation matches; memory-file residency immediately before first target open was 100% for every resident observation and 0% for every targeted-cold observation. Every actual process hash/UID, canonical configuration, payload checksum, clock ordering and cleanup check passed. The frozen protocol, complete rows, eight exact-driver preflights, supporting imported sources and analysis are in [the existing audit bundle](formal4-control-audit.json.gz), under `fixed_state_reader_layout_20261108`.
+
+| Cache profile | Reader | Memory layout | Ready median ms | First payload checksum median ms | Observed ready + checksum median ms |
+| --- | --- | --- | ---: | ---: | ---: |
+| resident | baseline-reader | 33 layers | 368.022 | 880.662 | 1244.693 |
+| resident | baseline-reader | 1 layer | 315.445 | 916.585 | 1239.907 |
+| resident | current-reader | 33 layers | 353.352 | 852.283 | 1193.351 |
+| resident | current-reader | 1 layer | 291.920 | 853.041 | 1136.435 |
+| targeted-cold | baseline-reader | 33 layers | 1280.328 | 2002.895 | 3268.512 |
+| targeted-cold | baseline-reader | 1 layer | 687.595 | 1714.356 | 2388.452 |
+| targeted-cold | current-reader | 33 layers | 572.144 | 1663.832 | 2230.063 |
+| targeted-cold | current-reader | 1 layer | 539.142 | 1555.682 | 2086.176 |
+
+The reader changes help on the same 33-layer input: current/baseline readiness p50 ratio is 0.960 (one-sided 95% upper 0.998) for resident files and 0.447 (upper 0.466) for targeted-cold files. Corresponding observed combined p50 ratios are 0.959 (upper 0.981) and 0.682 (upper 0.703).
+
+A material layout cost remains. With the current reader, 33-layer/single-layer resident readiness is **1.210** (p50 upper 1.274; p95 ratio 1.193, upper 1.227), while the first checksum p50 ratio is 0.999 (upper 1.042). The resident combined p50 ratio is 1.050 (upper 1.085). Targeted-cold current-reader layout ratios are 1.061 for readiness (upper 1.099) and 1.069 for combined time (upper 1.102). These are fixed-state diagnostic ratios, not a new passing original acceptance result.
+
+Clock-aligned post-hoc event diagnostics locate most resident layout overhead before the first timestamped Firecracker file event: current-reader component medians are 191.659/131.620 ms (33/1 layers), 13.269/12.489 ms from that first event through resume completion, and 149.596/146.998 ms from resume through the public response. The first file event is **not process spawn**; source order places memory-device acquisition before logger configuration, so this first interval includes image/device preparation. These boundaries do not identify the responsible function. Component medians do not sum to the total median. Maximum wall-versus-monotonic discrepancy was 0.003108 ms and maximum alignment-bracket width 10.618 microseconds.
+
+All 24 contrast/endpoint statistics were independently reproduced from raw rows using the frozen original quantile/bootstrap functions and 10000 whole-block resamples, within 1e-12 (maximum absolute difference 1.11e-15). All primary formal4 numeric files remain unchanged; six of seven original latency cells still fail. Next work should localize the preparation interval before retaining another product change.
 
 ## Space and retention boundary
 
@@ -305,6 +330,26 @@ for metric, saved in study['statistics']['metrics'].items():
             assert math.isclose(recalculated[statistic][field], saved[statistic][field],
                                 rel_tol=1e-12, abs_tol=1e-12)
 print('ARM diagnostic ratios reproduced')
+
+study = json.load(gzip.open('docs/experiments/clear-memory-20261108/formal4-control-audit.json.gz', 'rt'))['fixed_state_reader_layout_20261108']
+points = {(r['cache_profile'], r['block'], r['reader'], r['layout']): r for r in study['measurements']}
+contrasts = (
+    ('current/baseline reader, layered', ('baseline-reader', 'layered'), ('current-reader', 'layered')),
+    ('current/baseline reader, flat', ('baseline-reader', 'flat'), ('current-reader', 'flat')),
+    ('layered/flat, baseline reader', ('baseline-reader', 'flat'), ('baseline-reader', 'layered')),
+    ('layered/flat, current reader', ('current-reader', 'flat'), ('current-reader', 'layered')),
+)
+for profile, result in study['analysis']['profiles'].items():
+    for label, denominator, numerator in contrasts:
+        for metric, saved in result['contrasts'][label].items():
+            recalculated = ratios([([points[(profile, b) + denominator][metric]],
+                                    [points[(profile, b) + numerator][metric]]) for b in range(30)],
+                                  10000, 20261108)
+            for statistic in ('p50', 'p95', 'mean'):
+                for field in ('ratio', 'upper_95_one_sided'):
+                    assert math.isclose(recalculated[statistic][field], saved[statistic][field],
+                                        rel_tol=1e-12, abs_tol=1e-12)
+print('All 24 prospective reader/layout contrast statistics reproduced')
 PYCODE
 ```
 
@@ -328,7 +373,7 @@ PYCODE
 
 ## Controlled comparison plan
 
-Status: proposed controls for subsequent work; no new performance trial is started by this document. Existing measurements and failures remain intact. The original confidence gates and seven workload cells are unchanged.
+Status: A retains the original seven-cell protocol and failures; the separately declared B cohort is now complete and reported above. This plan does not itself launch trials. The original confidence gates and seven workload cells are unchanged.
 
 ### Behavior to implement
 
