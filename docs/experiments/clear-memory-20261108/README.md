@@ -271,6 +271,20 @@ Rust 1.99.1 format checks, workspace all-target/all-feature Clippy, release buil
 
 The existing audit archive stores the final patch, source/build identities, command receipts and native summaries under `post_resume_memory_candidate_20261109`. ARM, OSS and original-implementation performance acceptance remain outstanding for this candidate. These correctness checks make no timing claim and do not change the earlier failed acceptance cells.
 
+## Original versus post-resume candidate pilot, no acceptance inference
+
+A separate pilot compares the original upstream implementation (server `0c169ed`, reader `741c0b3`) with the post-resume candidate (server `92c6324`, reader `e345d97`). This is a whole-implementation comparison, distinct from the preceding policy-only suffix32/suffix4 comparison. It uses the same original workload and timing/space definitions, kernel, Firecracker, seed and tools inputs, configuration and process-pool precondition. Both server builds identify Rust 1.99.1. All six observations complete; actual process UID/hash/path, checksums, canonical configurations, cold residency, cleanup and final input/tool hashes pass. Each workload has exactly one independent pair, without retries, exclusions, confidence intervals or acceptance inference.
+
+Columns show original / post-resume candidate. Readiness is the first restore after saving without explicit eviction; it is not guaranteed fully resident.
+
+| Workload | Memory layers | Chain save seconds | Post-save ready ms | First checksum ms | Candidate/original repository bytes | Candidate/original allocated state growth |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 MiB idle, 8 captures | 2 / 5 | 1.104 / 0.839 | 276.601 / 346.512 | 251.355 / 276.682 | 0.967 | 0.967 |
+| 512 MiB rotating, 96 captures | 2 / 5 | 123.293 / 27.913 | 303.700 / 327.840 | 1013.369 / 1116.909 | 0.342 | 0.355 |
+| 4096 MiB dense, 8 captures | 2 / 5 | 69.088 / 39.934 | 295.758 / 267.158 | 5300.422 / 4291.532 | 0.972 | 1.092 |
+
+The candidate has lower chain-save time in these observations, but idle/long-chain post-save readiness increases 25.3%/7.9%, long-chain first checksum increases 10.2%, and dense allocated state growth increases from 18,339,020,800 to 20,026,798,080 bytes. It is not accepted or adopted in code PR #5. Code inspection finds superseded unpublished raw-export links retained after compaction; attributing the measured excess bytes requires an ownership/allocation check or regression, not subtraction alone. No causal explanation for the remaining readiness/read cost is established. All 252 descriptive statistics and 126 ratios independently reconstruct exactly from raw observations. Sources, declaration, complete rows, actual configurations and validation receipts are embedded under `post_resume_original_pilot_20261109`. The original seven-cell acceptance counts and gates remain unchanged; earlier six failed timing cells remain failed.
+
 ## Space and retention boundary
 
 Space counts repository logical bytes and allocated node/work/serial bytes, deduplicating hard links by device/inode. Growth subtracts seeded input state and includes the running source's private baseline. Common binaries and fixed dependency images are excluded. The measured filesystem is ext4. The separate transient control runtime directories contained no regular files in the completed batch; writable device data lives under the counted work directories.
@@ -494,23 +508,24 @@ with tempfile.TemporaryDirectory() as directory:
 PYCODE
 ```
 
-To reproduce the memory suffix policy pilot's metric extraction and descriptive summaries:
+To reproduce both pilots' metric extraction and descriptive summaries independently:
 
 ```bash
 python3 - <<'PYCODE'
 import gzip, json, pathlib, subprocess, sys, tempfile
 bundle = json.load(gzip.open('docs/experiments/clear-memory-20261108/formal4-control-audit.json.gz', 'rt'))
-study = bundle['memory_suffix_policy_pilot_20261109']
-with tempfile.TemporaryDirectory() as directory:
-    root = pathlib.Path(directory)
-    raw = root / 'pilot-v2-results.json'
-    raw.write_text(json.dumps(study['complete_results']))
-    frozen = root / 'frozen-analyzer.py'
-    frozen.write_text(bundle['frozen_analyzer'])
-    script = root / 'analyze-memory-budget-pilot.py'
-    script.write_text(study['sources']['analyze-memory-budget-pilot.py'])
-    subprocess.run([sys.executable, str(script), str(raw), str(frozen)], check=True)
-    assert json.loads((root / 'pilot-v2-analysis.json').read_text()) == study['analysis']
+for namespace in ['memory_suffix_policy_pilot_20261109', 'post_resume_original_pilot_20261109']:
+    study = bundle[namespace]
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        raw = root / 'pilot-v2-results.json'
+        raw.write_text(json.dumps(study['complete_results']))
+        frozen = root / 'frozen-analyzer.py'
+        frozen.write_text(bundle['frozen_analyzer'])
+        script = root / 'analyze-memory-budget-pilot.py'
+        script.write_text(study['sources']['analyze-memory-budget-pilot.py'])
+        subprocess.run([sys.executable, str(script), str(raw), str(frozen)], check=True)
+        assert json.loads((root / 'pilot-v2-analysis.json').read_text()) == study['analysis']
 PYCODE
 ```
 
