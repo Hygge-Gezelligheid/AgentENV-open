@@ -351,6 +351,34 @@ The final source, including the clarified test prerequisite, is frozen and check
 
 Exact patches, source/build manifests, numeric calls, independent verifier and native summaries are in `partial_nowait_tail_read_20261109` in the existing audit archive. Original confirmation binaries, observations, gates and six failing latency cells remain unchanged. No new latency cohort is run for this commit.
 
+## Allocation audit of the post-resume pilot
+
+This section reexamines the **unfixed isolated suffix4/post-resume prototype**, not the current code review. The original single Intel dense pair used 4 GiB and eight saves; it is not a confirmation cohort. All values below are allocated bytes. Only the growth row subtracts the common seeded node allocation of 447,086,592 bytes.
+
+| Measurement boundary | Original | Unfixed prototype | Prototype minus original |
+| --- | ---: | ---: | ---: |
+| Repository after save8 | 18,785,632,256 | 18,252,926,976 | -532,705,280 |
+| Outside repository after save8 | 475,136 | 2,220,957,696 | +2,220,482,560 |
+| Total node growth after save8 | 18,339,020,800 | 20,026,798,080 | +1,687,777,280 |
+| Total state after source/old-record cleanup and latest-read check | 18,785,865,728 | 18,253,164,544 | -532,701,184 |
+
+The reported excess decomposes exactly: a 532,705,280-byte repository reduction plus a 2,220,482,560-byte increase outside the repository equals 1,687,777,280 extra bytes overall. The prototype's outside-repository allocation jumps at generation4, the first compaction, and remains elevated through generation7. The final boundary also deletes older records and checks the latest snapshot, so it is not a source-deletion-only observation.
+
+Source ownership explains a candidate mechanism. Captures are subdirectories of a shared live root, and `FirecrackerCaptureArtifacts` holds a path and root lease rather than deleting each subdirectory when publication returns. The root guard removes its tree when the last lease ends. POSIX publication hard-links immutable local layers where possible. A raw export omitted from the final compacted layer list can therefore retain an allocated inode in the live capture directory without ever entering the repository.
+
+A separate synthetic filesystem proof uses the existing isolated prototype's memory helper, one stable parent, eight dense 1 MiB generations, retained capture directories and same-filesystem publication links. It changes only the superseded-export unlink operation, in the same source directory and toolchain. Its census deduplicates device/inode and counts **memory `*.commit` files only**; it is not a new whole-node space or latency comparison.
+
+| Synthetic model after eight generations | Cleanup suppressed | Existing cleanup enabled |
+| --- | ---: | ---: |
+| Published memory-commit allocation | 8,503,296 | 8,503,296 |
+| Unpublished memory-commit allocation | 1,060,864 | 0 |
+| Unpublished inode count | 1 | 0 |
+| Published snapshots fully readable after live-root removal | 8 | 8 |
+
+With cleanup suppressed, capture4 retains the raw inode: it initially has two private names, then one after baseline replacement. Removing the live root releases it while published allocation remains unchanged. The new assertion fails with cleanup suppressed and passes with existing cleanup enabled; related prototype snapshot units, formatting and production Clippy also pass. This demonstrates the file-lifetime mechanism. It does **not** prove the exact filename/inode or 2,220,482,560-byte attribution in the retained Intel sample, which remains inaccessible by SSH. Empty/removed ARM native snapshot directories cannot replace that sample.
+
+The corresponding cleanup is already retained in code PR#5; no additional runtime code is added in this audit. Exact aggregate reconstruction, synthetic test patch, source variants, numeric inode rows and independent verifier are under `allocation_ownership_audit_20261109` in the existing archive. All preceding namespaces and original measurements remain unchanged. Original latency acceptance remains unmet.
+
 ## Space and retention boundary
 
 Space counts repository logical bytes and allocated node/work/serial bytes, deduplicating hard links by device/inode. Growth subtracts seeded input state and includes the running source's private baseline. Common binaries and fixed dependency images are excluded. The measured filesystem is ext4. The separate transient control runtime directories contained no regular files in the completed batch; writable device data lives under the counted work directories.
@@ -628,6 +656,23 @@ with tempfile.TemporaryDirectory() as directory:
     raw.write_text(json.dumps(data))
     script = root / 'verify.py'
     script.write_text(data['numeric_verifier_source'])
+    subprocess.run([sys.executable, str(script), str(raw)], check=True)
+PYCODE
+```
+
+To reconstruct the pilot allocation split and verify the isolated inode mechanism:
+
+```bash
+python3 - <<'PYCODE'
+import gzip, json, pathlib, subprocess, sys, tempfile
+bundle = json.load(gzip.open('docs/experiments/clear-memory-20261108/formal4-control-audit.json.gz', 'rt'))
+proof = bundle['allocation_ownership_audit_20261109']
+with tempfile.TemporaryDirectory() as directory:
+    root = pathlib.Path(directory)
+    raw = root / 'audit.json'
+    raw.write_text(json.dumps(bundle))
+    script = root / 'verify.py'
+    script.write_text(proof['independent_verifier_source'])
     subprocess.run([sys.executable, str(script), str(raw)], check=True)
 PYCODE
 ```
