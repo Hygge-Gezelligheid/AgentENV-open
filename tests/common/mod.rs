@@ -23,6 +23,9 @@ pub async fn setup() {
     let config = setup_runtime_only().await;
     DEFAULT_ROOTFS_IMAGE_CONFIG
         .get_or_init(|| async {
+            if let Some(path) = std::env::var_os("AENV_CLEAR_TEST_IMAGE_CONFIG") {
+                return PathBuf::from(path);
+            }
             let resolved = ImageResolver::new(config)
                 .resolve(TEST_ROOTFS_IMAGE)
                 .await

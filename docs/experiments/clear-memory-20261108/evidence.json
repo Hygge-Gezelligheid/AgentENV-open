@@ -1,0 +1,92 @@
+{
+  "baseline": "05323abea960ab9348208d774c320d3782651544",
+  "candidate_code": "367b29fcf989fa7a0ffcc65564451f7be6b280a1",
+  "status": "All seven formal4 confirmation cells are complete and pass payload/deletion and primary retained-history space checks. Six cells fail at least one unchanged latency gate; only 4096 MiB dense passes all latency gates. Later untimed runtime controls do not change acceptance.",
+  "numeric_data": "Measurements are unchanged; task-local absolute paths are normalized. Compressed JSON includes paired raw measurements.",
+  "files": {
+    "formal3-idle.json.gz": {
+      "sha256": "a73d0db3349cc3afa65f06e32ded74ec1abe7186e96166d78ff9a02b4de97941",
+      "bytes": 17048
+    },
+    "formal2-idle.json.gz": {
+      "sha256": "345f49b70ae65db3b203118b7dce706782e3491b6e9cce660c7b28c79b94433f",
+      "bytes": 17040
+    },
+    "formal2-rotating.json.gz": {
+      "sha256": "414438b1d05089971024350e9ffb0fdbe931fc2e31c80be8229b5b99505c9251",
+      "bytes": 17175
+    },
+    "formal2-hotspot.json.gz": {
+      "sha256": "09a252853ce838487c1d922282a441e92d7281561fe910b7575f6e4e5bf50b75",
+      "bytes": 17094
+    },
+    "equivalent-layout.json.gz": {
+      "sha256": "5f626797a706649ff0b5c86099d747b5159070ca5957bc72b72bd79397292f62",
+      "bytes": 4343
+    },
+    "reader-idle.json.gz": {
+      "sha256": "b52fb8cbad2c10328ef456bb6cf67b37682749b7079a979dbe956bcbd9504520",
+      "bytes": 5887
+    },
+    "formal2-dense-interrupted.json.gz": {
+      "sha256": "d70651e55925334def5a4038f48e57e60a720ae254c3d34785331629f48bdbe9",
+      "bytes": 23118
+    },
+    "reader-long.json.gz": {
+      "sha256": "038ed527a15d9911b159af80cae4eb2939478164d9a2b2e6ca3c609094e16111",
+      "bytes": 7793
+    },
+    "reader-long-prewarmed.json.gz": {
+      "sha256": "73a78f952f92860da63ed0dce3d1fed777bcea16238867354db83e7c1c7a6843",
+      "bytes": 7727
+    },
+    "formal4-idle.json.gz": {
+      "sha256": "b192308315b9b052561ce068034065c1b9dd65643f997f63b56d6d3a1588c81a",
+      "bytes": 55627
+    },
+    "confirmation-protocol.json": {
+      "sha256": "d2e967c82d259e7e8f50c02b20517d4fedd3d7982f9790ae3a32c6e3effbd794",
+      "bytes": 2350
+    },
+    "baseline-blocked-tasks.json": {
+      "sha256": "cd3691ee55d88ea97df473bf41576ef0d10158ad1beb9ce2c14d9bdead202340",
+      "bytes": 2227
+    },
+    "formal4-rotating.json.gz": {
+      "sha256": "99f9baab6ae47523341c3c99b07613ce5d018199397913d19df0b63810b3d478",
+      "bytes": 33018
+    },
+    "formal4-hotspot.json.gz": {
+      "sha256": "5ce42caa7fb88e2c47f3a5a8f1649cce5d8c61361bbcee5d01dd178dde6ed211",
+      "bytes": 32758
+    },
+    "formal4-dense.json.gz": {
+      "sha256": "dc62212dca399324f3d4ce531465d66f0bba1213f3288e2f0589cd4da414de0f",
+      "bytes": 18603
+    },
+    "reader-controls-arm.json.gz": {
+      "sha256": "61ede571523d98f7c4983e17b3870764584f5a1bd63a446600ffbbaf13c208bf",
+      "bytes": 44230
+    },
+    "reader-geometry-arm.json.gz": {
+      "sha256": "17c84eb62abd4002a18c2ad1ca24144c2a4ef7dc3ab169b22a45a50bd8a32c6f",
+      "bytes": 38460
+    },
+    "formal4-4096-rotating.json.gz": {
+      "sha256": "3d2827df212bf27f2b4a2253a7cb978b1abe0202931b2f9cf70592d723ced1e2",
+      "bytes": 17522
+    },
+    "formal4-4096-dense.json.gz": {
+      "sha256": "0159e759976dc56db42a94062c444b8f441a6e8fe7a8258779d34f23f28ff8b9",
+      "bytes": 17894
+    },
+    "formal4-long.json.gz": {
+      "sha256": "0118013ef6cefa2dc82983e47214ca39b0874af227e9d183e4f216eb21fcdf19",
+      "bytes": 91896
+    },
+    "formal4-control-audit.json.gz": {
+      "sha256": "cf093343dd2c4d6b85300c170ebc8e115991739fc84a3987e342c4d3cf64b054",
+      "bytes": 3141957
+    }
+  }
+}

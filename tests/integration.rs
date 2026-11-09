@@ -20,3 +20,6 @@ mod posix_startup_pack;
 
 #[path = "integration/ublk.rs"]
 mod ublk;
+
+#[path = "integration/clear.rs"]
+mod clear;

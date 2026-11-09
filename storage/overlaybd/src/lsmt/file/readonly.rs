@@ -3,6 +3,7 @@ use super::types::*;
 use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use futures_util::{stream, StreamExt};
 use std::cmp::min;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -241,59 +242,48 @@ impl LSMTReadOnlyFile {
             let mut mappings: Vec<SegmentMapping> = Vec::new();
             self.index.lookup(query_segment, &mut mappings);
 
-            let mut current_blk = begin_blk;
-            let end_blk = begin_blk + count_blk;
-
+            let parallel = mappings.len() > 1;
+            let mut reads = Vec::new();
+            let mut tail = &mut buf[buf_pos..buf_pos + step];
+            let mut consumed = 0;
             for m in mappings {
-                if m.offset() > current_blk {
-                    let hole_blks = m.offset() - current_blk;
-                    let hole_bytes = (hole_blks * ALIGNMENT) as usize;
-
-                    let local_buf_pos = buf_pos + ((current_blk - begin_blk) * ALIGNMENT) as usize;
-                    let fill_len = min(hole_bytes, step.saturating_sub(local_buf_pos - buf_pos));
-                    if fill_len > 0 {
-                        buf[local_buf_pos..local_buf_pos + fill_len].fill(0);
-                    }
-                    current_blk = m.offset();
-                }
-
-                if current_blk >= end_blk {
+                let start = ((m.offset() - begin_blk) * ALIGNMENT) as usize;
+                if start >= step {
                     break;
                 }
-
-                let local_buf_pos = buf_pos + ((current_blk - begin_blk) * ALIGNMENT) as usize;
-                if local_buf_pos - buf_pos >= step {
-                    break;
-                }
-
-                let chunk_bytes = (m.length() as u64 * ALIGNMENT) as usize;
-                let actual_copy_len = min(chunk_bytes, step - (local_buf_pos - buf_pos));
-
+                let (hole, rest) = tail.split_at_mut(start - consumed);
+                hole.fill(0);
+                let length = min((u64::from(m.length()) * ALIGNMENT) as usize, rest.len());
+                let (destination, rest) = rest.split_at_mut(length);
+                tail = rest;
+                consumed = start + length;
                 if m.zeroed {
-                    buf[local_buf_pos..local_buf_pos + actual_copy_len].fill(0);
+                    destination.fill(0);
                 } else {
-                    let phys_offset = m.moffset * ALIGNMENT;
-                    let layer_idx = m.tag as usize;
-
-                    if let Some(layer) = self.layers.get(layer_idx) {
-                        read_exact(
-                            reader,
-                            layer.as_ref(),
-                            phys_offset,
-                            &mut buf[local_buf_pos..local_buf_pos + actual_copy_len],
-                        )
-                        .await?;
+                    let layer = self
+                        .layers
+                        .get(m.tag as usize)
+                        .with_context(|| format!("Layer index {} out of range", m.tag))?;
+                    let read =
+                        read_exact(reader, layer.as_ref(), m.moffset * ALIGNMENT, destination);
+                    if parallel {
+                        reads.push(read);
                     } else {
-                        bail!("Layer index {} out of range", layer_idx);
+                        read.await?;
                     }
                 }
-                current_blk = m.end();
             }
+            tail.fill(0);
 
-            if current_blk < end_blk {
-                let local_buf_pos = buf_pos + ((current_blk - begin_blk) * ALIGNMENT) as usize;
-                if local_buf_pos - buf_pos < step {
-                    buf[local_buf_pos..buf_pos + step].fill(0);
+            if !reads.is_empty() {
+                // Disjoint destinations let independent mappings overlap IO.
+                // Drain every borrowed-buffer read before propagating an error.
+                let results = stream::iter(reads)
+                    .buffer_unordered(32)
+                    .collect::<Vec<_>>()
+                    .await;
+                for result in results {
+                    result?;
                 }
             }
 

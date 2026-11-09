@@ -18,8 +18,9 @@ use super::config::{
 };
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
-    build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
-    restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
+    build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd, memory_stable_prefix_len,
+    refresh_memory_descriptors, restack_snapshot_overlaybd_device,
+    restack_snapshot_overlaybd_rootfs, retain_memory_baseline,
 };
 use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::resources::SandboxResources;
@@ -195,6 +196,12 @@ pub struct FirecrackerSandbox {
     initial_guest_drive_mounts: Vec<(usize, ExtraDrive)>,
     current_rootfs_virtual_size: Option<u64>,
     live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
+    /// Owned local baseline after the last successful CLEAR. Its directory is
+    /// independent of capture artifacts, which publication/pause may discard.
+    memory_baseline: Option<TempDir>,
+    memory_stable_prefix_len: Option<usize>,
+    /// GET/CLEAR can consume KVM records even when their response is lost.
+    memory_tracking_valid: bool,
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -382,6 +389,10 @@ impl SandboxBackend for FirecrackerSandbox {
             .await
             .map_err(SandboxCaptureError::terminal)?;
 
+        self.refresh_snapshot_memory_descriptors(&snapshot_config)
+            .await
+            .map_err(SandboxCaptureError::terminal)?;
+
         Ok(CapturedSandboxSnapshot::new(
             manifest,
             FirecrackerCaptureArtifacts::new(snapshot_config, snapshot_dir, live_snapshot_root),
@@ -438,6 +449,10 @@ impl SandboxBackend for FirecrackerSandbox {
         };
 
         FirecrackerSandbox::resume(self)
+            .await
+            .map_err(SandboxCaptureError::terminal)?;
+
+        self.refresh_snapshot_memory_descriptors(&snapshot_config)
             .await
             .map_err(SandboxCaptureError::terminal)?;
 
@@ -640,6 +655,29 @@ impl FirecrackerSandbox {
             )));
         }
         Err(capture_error)
+    }
+
+    async fn refresh_snapshot_memory_descriptors(
+        &self,
+        snapshot: &FirecrackerSnapshotConfig,
+    ) -> Result<()> {
+        if let Some(baseline) = &self.memory_baseline {
+            refresh_memory_descriptors(
+                &baseline.path().join("image.json"),
+                &snapshot.mem_overlaybd_config.image_config_path,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn ensure_memory_tracking_valid(&self) -> Result<()> {
+        if !self.memory_tracking_valid {
+            return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
+                "dirty memory tracking is unreliable; stop this instance and restore a committed snapshot"
+            )).into());
+        }
+        Ok(())
     }
 
     fn snapshot_rootfs_virtual_size(&self) -> Result<u64> {
@@ -1001,6 +1039,7 @@ impl FirecrackerSandbox {
         &mut self,
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
+        self.ensure_memory_tracking_valid()?;
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
         if self.has_writable_persistent_volumes() {
             let envd = self
@@ -1026,7 +1065,7 @@ impl FirecrackerSandbox {
     }
 
     async fn snapshot_to_dir(
-        &self,
+        &mut self,
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
@@ -1039,14 +1078,26 @@ impl FirecrackerSandbox {
         // Build the memory image config: collect parent layers, make runtime
         // lowers local to this snapshot dir, and compact only if the layer
         // count exceeds the configured maximum.
-        let resume_mem_image_config_path = match &self.launch {
+        let baseline_path = self
+            .memory_baseline
+            .as_ref()
+            .map(|dir| dir.path().join("image.json"));
+        let resume_mem_image_config_path = baseline_path.as_deref().or(match &self.launch {
             LaunchMode::Resume(config) => {
                 Some(config.mem_overlaybd_config.image_config_path.as_path())
             }
             LaunchMode::Fresh(_) => None,
+        });
+        let stable_prefix_len = match self.memory_stable_prefix_len {
+            Some(count) => count,
+            None => resume_mem_image_config_path
+                .map(memory_stable_prefix_len)
+                .transpose()?
+                .unwrap_or(0),
         };
         let mem_image_config = build_mem_snapshot_image_config(
             resume_mem_image_config_path,
+            self.memory_stable_prefix_len,
             &mem_layer_path,
             snapshot_dir,
             OverlaybdCompactOutput::Raw,
@@ -1167,6 +1218,32 @@ impl FirecrackerSandbox {
             memory_startup_pack: None,
         };
 
+        if self.launch.common().track_dirty_pages {
+            let root = self.live_snapshot_root().await?;
+            let baseline = tempfile::Builder::new()
+                .prefix("memory-baseline-")
+                .tempdir_in(root.path())?;
+            retain_memory_baseline(
+                &snapshot.mem_overlaybd_config.image_config_path,
+                baseline.path(),
+            )
+            .await?;
+            // Stay poisoned across cancellation or an ambiguous response. A
+            // partial KVM clear cannot safely be retried on this instance.
+            self.memory_tracking_valid = false;
+            tokio::time::timeout(
+                self.runtime_policy.socket_timeout,
+                self.fc_instance.clear_dirty_memory(),
+            )
+            .await
+            .context("timed out clearing dirty memory records")
+            .and_then(|result| result)
+            .map_err(|error| anyhow::Error::from(SandboxCaptureError::terminal(error)))?;
+            self.memory_baseline = Some(baseline);
+            self.memory_stable_prefix_len = Some(stable_prefix_len);
+            self.memory_tracking_valid = true;
+        }
+
         debug!(
             vm_state_path = %snapshot.vm_state_path.display(),
             mem_image_config_path = %snapshot.mem_overlaybd_config.image_config_path.display(),
@@ -1177,7 +1254,7 @@ impl FirecrackerSandbox {
     }
 
     async fn snapshot_memory_to_overlaybd(
-        &self,
+        &mut self,
         vm_state_path: &Path,
         snapshot_dir: &Path,
         memory_output: OverlaybdCompactOutput,
@@ -1190,7 +1267,23 @@ impl FirecrackerSandbox {
         // `vm_state.bin` now represents this paused VM state. Any later
         // error aborts this direct snapshot attempt and is propagated to
         // the lifecycle caller for recovery.
-        let dirty_ranges = self.fc_instance.get_dirty_memory_ranges().await?;
+        let tracking = self.launch.common().track_dirty_pages;
+        self.memory_tracking_valid = !tracking;
+        let dirty_ranges = tokio::time::timeout(
+            self.runtime_policy.socket_timeout,
+            self.fc_instance.get_dirty_memory_ranges(),
+        )
+        .await
+        .context("timed out querying dirty memory ranges")
+        .and_then(|result| result)
+        .map_err(|error| {
+            if tracking {
+                anyhow::Error::from(SandboxCaptureError::terminal(error))
+            } else {
+                error
+            }
+        })?;
+        self.memory_tracking_valid = true;
         convert_dirty_memory_to_overlaybd(
             firecracker_pid,
             &dirty_ranges,
@@ -1205,6 +1298,7 @@ impl FirecrackerSandbox {
     ///
     /// Use this when you want to keep the same sandbox instance.
     pub async fn resume(&self) -> Result<()> {
+        self.ensure_memory_tracking_valid()?;
         debug!("resuming paused sandbox in-place");
         self.fc_instance.resume().await
     }
@@ -1508,6 +1602,9 @@ impl FirecrackerSandbox {
             frozen_volume_mounts: Vec::new(),
             initial_guest_drive_mounts: Vec::new(),
             live_snapshot_root: None,
+            memory_baseline: None,
+            memory_stable_prefix_len: None,
+            memory_tracking_valid: true,
         })
     }
 
@@ -2480,6 +2577,9 @@ impl FirecrackerSandbox {
 
     fn runtime_image_config_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
+        if let Some(baseline) = &self.memory_baseline {
+            paths.push(baseline.path().join("image.json"));
+        }
         if let Some(tools) = &self.resources.tools_ublk_device {
             paths.push(tools.image_config_path().to_path_buf());
         }
@@ -2636,6 +2736,235 @@ mod tests {
             "0.1.0".to_string(),
             "user-image.json".into(),
         )
+    }
+
+    async fn clear_test_sandbox(memory_mib: u32) -> Result<FirecrackerSandbox> {
+        crate::logging::init_for_tests();
+        let config = ConfigManager::init_global()?.config();
+        UblkDeviceManager::init_global_from_config(config).await?;
+        let image = std::env::var_os("AENV_CLEAR_TEST_IMAGE_CONFIG")
+            .context("set AENV_CLEAR_TEST_IMAGE_CONFIG to a prepared local image")?;
+        let mut config =
+            FirecrackerSandboxConfig::from_global_config_with_user_image(OverlaybdConfig {
+                image_config_path: image.into(),
+                read_only: false,
+                runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+            })?;
+        config.vcpu_count = 2;
+        config.mem_size_mib = memory_mib;
+        config.common.track_dirty_pages = true;
+        let mut sandbox = FirecrackerSandbox::new(config)?;
+        sandbox.start().await?;
+        Ok(sandbox)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated KVM/ublk state and AENV_CLEAR_TEST_IMAGE_CONFIG"]
+    async fn clear_snapshot_matches_complete_guest_memory() -> Result<()> {
+        assert_complete_snapshot_memory(512).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated KVM/ublk state and at least 4 GiB available memory"]
+    async fn clear_snapshot_matches_complete_large_guest_memory() -> Result<()> {
+        assert_complete_snapshot_memory(4096).await
+    }
+
+    async fn assert_complete_snapshot_memory(memory_mib: u32) -> Result<()> {
+        use super::super::process_vm_reader::ProcessVmReader;
+        use overlaybd::{backend::local::LocalFile, virtual_file::VirtualFile};
+        let mut sandbox = clear_test_sandbox(memory_mib).await?;
+        let store = tempfile::tempdir()?;
+        let result = async {
+            for generation in 0..4 {
+                let command = match generation {
+                    0 => "head -c 16777216 /dev/zero | tr '\\000' '\\125' > /run/oracle",
+                    1 => "dd if=/dev/zero of=/run/oracle bs=1048576 count=4 conv=notrunc status=none",
+                    2 => "true",
+                    _ => "head -c 1048576 /dev/zero | tr '\\000' '\\252' | dd of=/run/oracle bs=1048576 seek=8 conv=notrunc status=none",
+                };
+                let output = sandbox.run_command("sh", &["-c", command]).await?;
+                anyhow::ensure!(output.exit_code == 0, "oracle write failed: {}", output.stderr);
+                let directory = store.path().join(generation.to_string());
+                let (snapshot, _) = sandbox.pause_to_dir(&directory).await?;
+                let regions = sandbox.fc_instance.guest_memory_regions_for_test().await?;
+                let reader = ProcessVmReader::new(sandbox.fc_instance.pid()?);
+                let image = overlaybd::config::load_image_config(&snapshot.mem_overlaybd_config.image_config_path)?;
+                let files = image.lowers.iter().map(|lower| {
+                    anyhow::ensure!(!lower.file.is_empty(), "oracle requires materialized memory layers");
+                    Ok(Arc::new(LocalFile::open_ro(&lower.file)?) as Arc<dyn VirtualFile>)
+                }).collect::<Result<Vec<_>>>()?;
+                let restored = overlaybd::index_file::open_files_ro(&files).await?;
+                let mut compared = 0u64;
+                for region in regions {
+                    let base = u64::try_from(region.base_host_virt_addr)?;
+                    let size = u64::try_from(region.size)?;
+                    let image_offset = u64::try_from(region.offset)?;
+                    let mut offset = 0;
+                    while offset < size {
+                        let length = (size - offset).min(1024 * 1024) as usize;
+                        let expected = reader.read_at(base + offset, length).await?;
+                        let actual = restored.read_at(image_offset + offset, length).await?;
+                        anyhow::ensure!(actual == expected,
+                            "generation {generation}: memory differs at image offset {}", image_offset + offset);
+                        offset += length as u64;
+                        compared += length as u64;
+                    }
+                }
+                anyhow::ensure!(compared == u64::from(memory_mib) * MIB, "incomplete full-memory oracle: {compared}");
+                println!("full-memory generation={generation} bytes={compared} PASS");
+                if generation == 1 {
+                    sandbox.stop().await?;
+                    sandbox = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
+                } else {
+                    sandbox.resume().await?;
+                }
+            }
+            Ok(())
+        }.await;
+        sandbox.stop().await?;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated KVM/ublk state and AENV_CLEAR_TEST_IMAGE_CONFIG"]
+    async fn clear_failure_or_lost_response_never_resumes_instance() -> Result<()> {
+        use http_body_util::{BodyExt, Full};
+        use hyper::{
+            body::{Bytes, Incoming},
+            server::conn::http1,
+            service::service_fn,
+            Request, Response,
+        };
+        use hyper_util::rt::TokioIo;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for mode in ["rejected", "lost", "timeout"] {
+            let mut sandbox = clear_test_sandbox(512).await?;
+            let store = tempfile::tempdir()?;
+            let (baseline, _) = sandbox.pause_to_dir(&store.path().join("baseline")).await?;
+            sandbox.resume().await?;
+            let socket = store.path().join("proxy.sock");
+            let listener = tokio::net::UnixListener::bind(&socket)?;
+            let original_socket = sandbox.fc_instance.redirect_api_for_test(socket);
+            let upstream = super::super::socket::UnixSocketClient::new(original_socket);
+            let observed = Arc::new(AtomicUsize::new(0));
+            let count = observed.clone();
+            let proxy_upstream = upstream.clone();
+            let proxy = tokio::spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let client = proxy_upstream.clone();
+                    let count = count.clone();
+                    connections.spawn(async move {
+                        let service = service_fn(move |request: Request<Incoming>| {
+                            let client = client.clone();
+                            let count = count.clone();
+                            async move {
+                                let method = request.method().clone();
+                                let path = request.uri().path().to_owned();
+                                let body = request
+                                    .collect()
+                                    .await
+                                    .map_err(std::io::Error::other)?
+                                    .to_bytes();
+                                let body = if body.is_empty() {
+                                    None
+                                } else {
+                                    Some(
+                                        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                                    )
+                                };
+                                let clear = path == "/vm/dirty-memory-ranges/clear";
+                                if clear {
+                                    count.fetch_add(1, Ordering::SeqCst);
+                                    if mode == "rejected" {
+                                        return Ok::<_, std::io::Error>(
+                                            Response::builder()
+                                                .status(400)
+                                                .body(Full::new(Bytes::from_static(
+                                                    b"dirty log failure",
+                                                )))
+                                                .unwrap(),
+                                        );
+                                    }
+                                }
+                                let result: serde_json::Value = client
+                                    .request(method, &path, body.as_ref())
+                                    .await
+                                    .map_err(std::io::Error::other)?;
+                                if clear {
+                                    if mode == "timeout" {
+                                        std::future::pending::<()>().await;
+                                    }
+                                    return Err(std::io::Error::other(
+                                        "discard committed CLEAR response",
+                                    ));
+                                }
+                                let (status, bytes) = if result.is_null() {
+                                    (204, Vec::new())
+                                } else {
+                                    (200, serde_json::to_vec(&result).unwrap())
+                                };
+                                Ok(Response::builder()
+                                    .status(status)
+                                    .body(Full::new(Bytes::from(bytes)))
+                                    .unwrap())
+                            }
+                        });
+                        let _ = http1::Builder::new()
+                            .keep_alive(false)
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            });
+            sandbox.runtime_policy.socket_timeout = std::time::Duration::from_millis(300);
+            let outcome = async {
+                let error = SandboxBackend::snapshot(&mut sandbox)
+                    .await
+                    .expect_err("fault must fail capture");
+                anyhow::ensure!(error.is_terminal(), "CLEAR {mode} was recoverable");
+                anyhow::ensure!(observed.load(Ordering::SeqCst) == 1);
+                anyhow::ensure!(!sandbox.memory_tracking_valid);
+                anyhow::ensure!(
+                    sandbox.resume().await.is_err(),
+                    "CLEAR {mode} resumed the instance"
+                );
+                let state: serde_json::Value = upstream
+                    .request::<(), _>(hyper::Method::GET, "/", None)
+                    .await?;
+                anyhow::ensure!(
+                    state["state"] == "Paused",
+                    "CLEAR {mode} left VM running: {state}"
+                );
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            proxy.abort();
+            let _ = proxy.await;
+            sandbox.stop().await?;
+            outcome?;
+            let mut restored = FirecrackerSandbox::resume_from_snapshot_config(&baseline).await?;
+            let output = restored.run_command("true", &[]).await;
+            restored.stop().await?;
+            anyhow::ensure!(output?.exit_code == 0);
+            println!("CLEAR failure mode={mode}: terminal, paused, baseline restores PASS");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unreliable_memory_tracking_blocks_resume_and_capture() -> Result<()> {
+        let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
+        sandbox.memory_tracking_valid = false;
+        let error = sandbox.resume().await.unwrap_err();
+        assert!(SandboxCaptureError::from(error).is_terminal());
+        let directory = tempfile::tempdir()?;
+        let error = sandbox.pause_to_dir(directory.path()).await.unwrap_err();
+        assert!(SandboxCaptureError::from(error).is_terminal());
+        assert!(std::fs::read_dir(directory.path())?.next().is_none());
+        Ok(())
     }
 
     #[test]

@@ -1,0 +1,92 @@
+{
+  "case": 0,
+  "snapshot": "01a1b5a0-0bc7-72e3-bd40-90b49a2c286a",
+  "root_first": true,
+  "probes": [
+    {
+      "kind": "process",
+      "explicit_root": true,
+      "ok": false,
+      "error": "TimeoutError",
+      "elapsed_ms": 5016.378350555897
+    },
+    {
+      "kind": "process",
+      "explicit_root": false,
+      "ok": false,
+      "error": "TimeoutError",
+      "elapsed_ms": 5006.478575989604
+    },
+    {
+      "kind": "file",
+      "path": "/etc/passwd",
+      "username": "root",
+      "error": "TimeoutError",
+      "elapsed_ms": 5006.266922689974
+    },
+    {
+      "kind": "file",
+      "path": "/proc/version",
+      "username": "root",
+      "error": "TimeoutError",
+      "elapsed_ms": 5006.286063231528
+    },
+    {
+      "kind": "file",
+      "path": "/proc/1/stack",
+      "username": "root",
+      "error": "TimeoutError",
+      "elapsed_ms": 5006.2616700306535
+    },
+    {
+      "kind": "guest_sysrq_blocked_tasks",
+      "status": 200,
+      "bytes": 69,
+      "elapsed_ms": 52.57742665708065
+    }
+  ],
+  "observed_blocked_tasks": [
+    {
+      "name": "ext4lazyinit",
+      "state": "D",
+      "selected_stack_frames": [
+        "io_schedule",
+        "__lock_buffer",
+        "ext4_read_block_bitmap_nowait",
+        "ext4_run_li_request"
+      ]
+    },
+    {
+      "name": "envd",
+      "state": "D",
+      "selected_stack_frames": [
+        "io_schedule",
+        "__wait_on_buffer",
+        "__ext4_find_entry",
+        "ext4_lookup"
+      ]
+    },
+    {
+      "name": "envd",
+      "state": "D",
+      "selected_stack_frames": [
+        "io_schedule",
+        "folio_wait_bit_common",
+        "filemap_read",
+        "ext4_file_read_iter"
+      ]
+    },
+    {
+      "name": "sh",
+      "state": "D",
+      "selected_stack_frames": [
+        "io_schedule",
+        "folio_wait_bit_common",
+        "filemap_fault",
+        "handle_mm_fault"
+      ]
+    }
+  ],
+  "interpretation": "Guest ext4 I/O waits observed; root cause unresolved. Not proof of memory corruption, APF failure, or a specific runtime defect.",
+  "diagnostic_limitation": "Second iteration stopped on request-wrapper recursion before VM creation; only the first iteration is evidence. No diagnostic processes remained."
+}
