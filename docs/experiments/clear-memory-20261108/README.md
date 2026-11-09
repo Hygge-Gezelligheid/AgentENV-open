@@ -379,6 +379,31 @@ With cleanup suppressed, capture4 retains the raw inode: it initially has two pr
 
 The corresponding cleanup is already retained in code PR#5; no additional runtime code is added in this audit. Exact aggregate reconstruction, synthetic test patch, source variants, numeric inode rows and independent verifier are under `allocation_ownership_audit_20261109` in the existing archive. All preceding namespaces and original measurements remain unchanged. Original latency acceptance remains unmet.
 
+## Masked ancestor compaction, correctness only
+
+This unretained candidate addresses layer preparation at the producer. Code PR #5 stays at `6fae186`; no new timed cohort is run and original acceptance remains unmet.
+
+All 33 layers in the same retained ARM 96-generation input contribute visible data. Whole-file pruning cannot reduce that stack. A byte-equivalent alternative keeps the stable base and newest raw delta, and merges only older mappings still visible beneath the newest data or explicit zeros. The fixed input then has three layers. All 536,870,912 logical bytes match, SHA256 `3f6cc95f6fc502ff3463c986a3cbe8afe1e127532e23dc74cbcb5c6209106878`; all 33 original blob identities and the saved VM-state record remain unchanged.
+
+The existing single-file compactor also retains source-layer tags in output mappings, preventing adjacent extents from coalescing. Four production lines in the existing `storage/overlaybd/src/lsmt/file/helper.rs` normalize output tags before index compression. One assertion in the existing merged-stack test fails before correction and passes after. No reader-constructor coalescing is added.
+
+| Same fixed input/output rule | Existing producer | Normalized producer |
+| --- | ---: | ---: |
+| Retained layers | 3 | 3 |
+| Compacted older data bytes | 285,655,040 | 285,655,040 |
+| Resulting merged-index entries | 3,755 | 1,838 |
+| Older-parent file bytes | 285,708,288 | 285,675,520 |
+
+These are structural counts and file sizes, not latency or retained-history space estimates. The latest raw delta is preserved byte-for-byte; merged ancestors contain history.
+
+The runtime candidate uses the existing finalization step after an ordinary tracked capture resumes, with a fixed memory-only suffix budget 3. It keeps the newest raw delta separate, preserves the stable prefix and deletes superseded owned links only after both config writes succeed. Depending on the capture, the suffix has two or three layers; this is not a universal three-layer total. Rootfs policy remains 32, and a pre-CLEAR guard rejects stacks above the reader's 255-layer maximum.
+
+The candidate differs from current code PR #5 in five existing files: memory helper, sandbox lifecycle, existing integration suite, storage writer helper and existing storage tests. If retained, the complete code PR would touch ten existing paths with zero added Rust or Markdown files. No configuration key, module or reader mechanism is introduced. Source/control manifests, exact patches, build settings and both release profiles are frozen; the matched control is current `6fae186`, not original upstream.
+
+Checks pass: 408 storage units/four ignored; 21 snapshot units/one ignored; mixed-codec tests; formatting; strict changed-crate all-target/all-feature and production workspace all-feature Clippy. Native checks pass 72 full-memory comparisons (36 generations at each of 512 MiB/4 GiB), CLEAR faults and all five incremental integrations including 96 restores. Tests cover zero overrides, completely masked ancestors, stable holes, prefix ownership, capture cleanup, failure preservation, idempotence and layer bounds. Program UID/hash, unchanged 872-file source, 33 input blobs and owned-process cleanup are verified. Earlier compilation/fixture failures and intended regression failures remain in their receipts; none counts as a successful run.
+
+`masked_memory_compaction_20261109` in the existing archive contains exact scripts, source revisions, numeric summaries, hashes and a runnable independent verifier. It reconstructs the structural counts and checks saved identities; it does not rerun private full-memory comparisons or establish performance. Current Intel/OSS and original confirmation coverage are not refreshed. No candidate code is adopted on correctness evidence alone.
+
 ## Space and retention boundary
 
 Space counts repository logical bytes and allocated node/work/serial bytes, deduplicating hard links by device/inode. Growth subtracts seeded input state and includes the running source's private baseline. Common binaries and fixed dependency images are excluded. The measured filesystem is ext4. The separate transient control runtime directories contained no regular files in the completed batch; writable device data lives under the counted work directories.
@@ -673,6 +698,23 @@ with tempfile.TemporaryDirectory() as directory:
     raw.write_text(json.dumps(bundle))
     script = root / 'verify.py'
     script.write_text(proof['independent_verifier_source'])
+    subprocess.run([sys.executable, str(script), str(raw)], check=True)
+PYCODE
+```
+
+To verify the masked-ancestor structural counts, source/control identities and native summaries:
+
+```bash
+python3 - <<'PYCODE'
+import gzip, json, pathlib, subprocess, sys, tempfile
+bundle = json.load(gzip.open('docs/experiments/clear-memory-20261108/formal4-control-audit.json.gz', 'rt'))
+data = bundle['masked_memory_compaction_20261109']
+with tempfile.TemporaryDirectory() as directory:
+    root = pathlib.Path(directory)
+    raw = root / 'proof.json'
+    raw.write_text(json.dumps(data))
+    script = root / 'verify.py'
+    script.write_text(data['independent_verifier_source'])
     subprocess.run([sys.executable, str(script), str(raw)], check=True)
 PYCODE
 ```
