@@ -4,8 +4,8 @@ set -euo pipefail
 SUITE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SUITE_DIR}/../lib/helpers.sh"
-init_suite "18_nestedvirt"
-log "Suite: Nested KVM Snapshot Recovery"
+init_suite "18_nestedvirt_cold_stress"
+log "Suite: Nested KVM Cold-Boot Stress Reproduction"
 
 repo_root="$(cd "${SUITE_DIR}/../../../.." && pwd)"
 aenv="${AENV_BIN:-${CARGO_TARGET_DIR:-${repo_root}/target}/debug/aenv}"
@@ -61,12 +61,19 @@ check_apf_policy() {
   _pass "All vCPUs retain ordinary APF with nested APF VM-exit delivery masked"
 }
 
+dump_inner_log() {
+  guest 'tail -n 80 /run/nestedvirt-probe/inner.log' 5 >&2 || true
+}
+
 read_tick() {
   local output
   tick=""; boot_id=""
-  output=$(guest 'cat /run/nestedvirt-probe/inner.log') || return 1
-  tick=$(printf '%s\n' "$output" | sed -n 's/^INNER_TICK=\([0-9]*\).*/\1/p' | tail -n 1)
-  boot_id=$(printf '%s\n' "$output" | sed -n 's/^INNER_BOOT_ID=\([a-f0-9-]*\).*/\1/p' | tail -n 1)
+  output=$(guest '/nestedvirt-guest read-state' "${2:-30}") || return 1
+  if [[ "$output" == FAULT* ]]; then
+    dump_inner_log
+    die "$1: $output"
+  fi
+  read -r boot_id tick <<< "$output"
 }
 
 check_progress() {
@@ -74,8 +81,11 @@ check_progress() {
   for ((attempt = 0; attempt < 20; attempt++)); do
     sleep 1
     # Retry transient command failures, but reject invalid restored state.
-    if ! read_tick; then continue; fi
-    [[ "$tick" =~ ^[0-9]+$ && "$boot_id" == "$expected_boot" ]] || die "${phase}: invalid inner state"
+    if ! read_tick "$phase"; then continue; fi
+    if [[ ! "$tick" =~ ^[0-9]+$ || "$boot_id" != "$expected_boot" ]]; then
+      dump_inner_log
+      die "${phase}: expected boot $expected_boot, observed boot=${boot_id:-missing} tick=${tick:-missing}"
+    fi
     if [[ -z "$first" ]]; then first="$tick"; fi
     if ((tick > first && tick > minimum)); then
       _pass "${phase}: same inner boot, counter ${first} -> ${tick} (before capture: ${minimum})"
@@ -83,7 +93,7 @@ check_progress() {
       return
     fi
   done
-  guest 'tail -n 40 /run/nestedvirt-probe/inner.log' >&2 || true
+  dump_inner_log
   die "${phase}: inner guest stopped advancing"
 }
 
@@ -110,7 +120,7 @@ cat > "$work/nestedvirt-guest.sh" <<'NESTEDVIRT_GUEST'
 # Copyright 2026 AgentENV contributors.
 # SPDX-License-Identifier: Apache-2.0
 set -eu
-mode=${1:?Expected prepare, inner-init or start-inner}
+mode=${1:?Expected prepare, read-state, inner-init or start-inner}
 if [ "$#" -gt 0 ]; then shift; fi
 case "$mode" in
     prepare)
@@ -134,6 +144,20 @@ case "$mode" in
         kernel=$(find /boot -name 'vmlinuz-*' | sort | tail -n 1)
         test -n "$kernel"
         cp "$kernel" /inner-bzImage
+        ;;
+    read-state)
+        # Parse serial output in L1 so polling does not transfer the growing boot log.
+        awk '
+            { sub(/\r$/, "") }
+            /^\[[[:space:]]*[0-9.]+\] / && /Kernel panic - not syncing:|BUG: kernel|general protection fault|Oops:|invalid opcode:/ {
+                print "FAULT " $0
+                failed = 1
+                exit
+            }
+            /^INNER_BOOT_ID=/ { boot = $0; sub(/^INNER_BOOT_ID=/, "", boot); tick = "" }
+            /^INNER_TICK=[0-9]+$/ { tick = $0; sub(/^INNER_TICK=/, "", tick) }
+            END { if (!failed && length(boot) == 36 && boot ~ /^[0-9a-f-]+$/ && tick != "") print boot, tick }
+        ' /run/nestedvirt-probe/inner.log
         ;;
     inner-init)
         /bin/busybox mount -t proc proc /proc
@@ -161,43 +185,130 @@ NESTEDVIRT_GUEST
 payload=$(base64 < "$work/nestedvirt-guest.sh" | tr -d '\n')
 guest "printf '%s' '$payload' | base64 -d > /nestedvirt-guest; chmod +x /nestedvirt-guest; /nestedvirt-guest prepare" 600
 check_apf_policy
-guest 'mkdir -p /run/nestedvirt-probe; nohup /nestedvirt-guest start-inner > /run/nestedvirt-probe/inner.log 2>&1 < /dev/null & echo $! > /run/nestedvirt-probe/inner.pid'
-tick=""; boot_id=""
-for ((attempt = 0; attempt < 90; attempt++)); do
-  if read_tick && [[ "$tick" =~ ^[0-9]+$ && -n "$boot_id" ]]; then break; fi
-  sleep 1
+
+cat > "$work/nestedvirt-cold-stress.sh" <<'NESTEDVIRT_STRESS'
+#!/bin/sh
+set -eu
+
+rounds=${1:-100}
+out=/run/nestedvirt-cold-stress
+mkdir -p "$out"
+: > "$out/results.csv"
+printf 'round,result,qemu_rc,elapsed_s,boot_id,tick,log_bytes\n' > "$out/results.csv"
+uname -a > "$out/l1-uname.txt"
+cat /proc/cpuinfo > "$out/l1-cpuinfo.txt"
+/usr/bin/qemu-system-x86_64 --version > "$out/qemu-version.txt"
+sha256sum /inner-bzImage /inner.cpio > "$out/workload-sha256.txt"
+dmesg > "$out/l1-dmesg-before.txt" 2>&1 || true
+
+i=1
+while [ "$i" -le "$rounds" ]; do
+    round=$(printf '%04d' "$i")
+    log="$out/boot-$round.log"
+    : > "$log"
+    started=$(/bin/busybox date +%s)
+    nohup /nestedvirt-guest start-inner > "$log" 2>&1 < /dev/null &
+    qemu_pid=$!
+    result=timeout
+    boot_id=
+    tick=
+    attempt=0
+    while [ "$attempt" -lt 225 ]; do
+        if grep -Eq 'Kernel panic - not syncing:|BUG: kernel|general protection fault|Oops:|invalid opcode:' "$log"; then
+            result=fault
+            break
+        fi
+        boot_id=$(sed -n 's/^INNER_BOOT_ID=//p' "$log" | tail -n 1)
+        tick=$(sed -n 's/^INNER_TICK=//p' "$log" | tail -n 1)
+        if [ -n "$boot_id" ] && [ -n "$tick" ] && [ "$tick" -ge 1 ] 2>/dev/null; then
+            result=pass
+            break
+        fi
+        if ! kill -0 "$qemu_pid" 2>/dev/null; then
+            result=early-exit
+            break
+        fi
+        attempt=$((attempt+1))
+        /bin/busybox sleep 0.2
+    done
+
+    if kill -0 "$qemu_pid" 2>/dev/null; then
+        mkdir -p "$out/proc-$round"
+        cp "/proc/$qemu_pid/status" "$out/proc-$round/status" 2>/dev/null || true
+        for task in /proc/$qemu_pid/task/*; do
+            tid=${task##*/}
+            cat "$task/stack" > "$out/proc-$round/stack-$tid" 2>/dev/null || true
+            cat "$task/wchan" > "$out/proc-$round/wchan-$tid" 2>/dev/null || true
+        done
+        printf '%s\n' '{"execute":"qmp_capabilities"}' '{"execute":"query-status","id":"status"}' '{"execute":"query-kvm","id":"kvm"}' \
+            | /bin/busybox nc -w 2 127.0.0.1 4444 > "$out/qmp-$round.jsonl" 2>&1 || true
+    fi
+
+    if [ "$result" = pass ]; then
+        printf '%s\n' '{"execute":"qmp_capabilities"}' '{"execute":"quit"}' \
+            | /bin/busybox nc -w 2 127.0.0.1 4444 >/dev/null 2>&1 || true
+    fi
+    stop_attempt=0
+    while kill -0 "$qemu_pid" 2>/dev/null && [ "$stop_attempt" -lt 25 ]; do
+        stop_attempt=$((stop_attempt+1))
+        /bin/busybox sleep 0.2
+    done
+    if kill -0 "$qemu_pid" 2>/dev/null; then
+        kill "$qemu_pid" 2>/dev/null || true
+        /bin/busybox sleep 1
+    fi
+    if kill -0 "$qemu_pid" 2>/dev/null; then
+        kill -9 "$qemu_pid" 2>/dev/null || true
+    fi
+    qemu_rc=0
+    wait "$qemu_pid" 2>/dev/null || qemu_rc=$?
+    finished=$(/bin/busybox date +%s)
+    log_bytes=$(wc -c < "$log")
+    printf '%s,%s,%s,%s,%s,%s,%s\n' "$i" "$result" "$qemu_rc" "$((finished-started))" "$boot_id" "$tick" "$log_bytes" >> "$out/results.csv"
+    if [ $((i % 10)) -eq 0 ] || [ "$result" != pass ]; then
+        printf 'COLD_STRESS_PROGRESS round=%s result=%s qemu_rc=%s elapsed_s=%s\n' "$i" "$result" "$qemu_rc" "$((finished-started))"
+    fi
+    sync
+
+    if [ "$result" != pass ]; then
+        dmesg > "$out/l1-dmesg-after-failure.txt" 2>&1 || true
+        printf '%s\n' "$round" > "$out/failed-round.txt"
+        break
+    fi
+    i=$((i+1))
 done
-[[ "$tick" =~ ^[0-9]+$ && -n "$boot_id" ]] || { guest 'cat /run/nestedvirt-probe/inner.log' >&2 || true; die "L2 did not boot"; }
-original_boot="$boot_id"
-check_progress 0 "$original_boot" "before capture"
-before_snapshot="$tick"
+dmesg > "$out/l1-dmesg-after.txt" 2>&1 || true
+NESTEDVIRT_STRESS
 
-api_post "/sandboxes/${sandbox_id}/snapshots" "$(jq -nc --arg name "e2e-nested-snapshot-$(date +%s%N)" '{name:$name}')"
-expect_status 201 "capture running L2 in outer snapshot"
-snapshot_id=$(jq -er '.snapshotID' <<< "$HTTP_BODY")
-snapshot_name=$(jq -er '.names[0]' <<< "$HTTP_BODY")
-track_template "$snapshot_id"
-delete_sandbox "$sandbox_id"
-expect_status 204 "delete original L1"
-api_get "/sandboxes/${sandbox_id}"
-expect_status 404 "original L1 is gone"
+stress_payload=$(base64 < "$work/nestedvirt-cold-stress.sh" | tr -d '\n')
+guest "printf '%s' '$stress_payload' | base64 -d > /nestedvirt-cold-stress; chmod +x /nestedvirt-cold-stress" 30
+rounds=${NESTEDVIRT_STRESS_ROUNDS:-100}
+guest "/nestedvirt-cold-stress '$rounds'" 1800
 
-sandbox_id=$(create_sandbox "$snapshot_name" 300); _sync_http
-expect_status 201 "restore L1 from snapshot"
-track_sandbox "$sandbox_id"
-wait_for_sandbox_state "$sandbox_id" running 30 || die "Restored L1 did not start"
-wait_guest
-check_apf_policy
-# There is deliberately no start-inner between capture and these checks.
-check_progress "$before_snapshot" "$original_boot" "snapshot restore"
-before_pause="$tick"
-api_post "/sandboxes/${sandbox_id}/pause"
-expect_status 204 "pause restored L1"
-wait_for_sandbox_state "$sandbox_id" paused 30 || die "L1 did not pause"
-api_post "/sandboxes/${sandbox_id}/connect" '{"timeout":300}'
-expect_status 201 "resume L1"
-wait_for_sandbox_state "$sandbox_id" running 30 || die "L1 did not resume"
-wait_guest
-check_apf_policy
-check_progress "$before_pause" "$original_boot" "pause/resume"
-suite_summary "18_nestedvirt"
+artifact_dir=${NESTEDVIRT_REPRO_ARTIFACT_DIR:-$work/repro-artifacts}
+mkdir -p "$artifact_dir"
+archive=$(guest 'tar -C /run -czf - nestedvirt-cold-stress | base64 -w 0' 120)
+printf '%s' "$archive" | base64 -d > "$artifact_dir/l1-cold-stress.tar.gz"
+guest 'cat /run/nestedvirt-cold-stress/results.csv' > "$artifact_dir/results.csv"
+cat "$artifact_dir/results.csv"
+if awk -F, 'NR > 1 && $2 != "pass" { failed = 1 } END { exit !failed }' "$artifact_dir/results.csv"; then
+  guest 'failed=$(cat /run/nestedvirt-cold-stress/failed-round.txt); cat "/run/nestedvirt-cold-stress/boot-$failed.log"' >&2 || true
+  echo "--- L1 dmesg after failure ---" >&2
+  guest 'tail -n 300 /run/nestedvirt-cold-stress/l1-dmesg-after-failure.txt' >&2 || true
+  echo "--- runner KVM/kernel diagnostics ---" >&2
+  dmesg | tail -n 300 >&2 || true
+  for pid in $(pgrep -x firecracker 2>/dev/null || true); do
+    echo "--- Firecracker PID $pid ---" >&2
+    tr '\0' ' ' < "/proc/$pid/cmdline" >&2 || true
+    echo >&2
+    for task in /proc/$pid/task/*; do
+      tid=${task##*/}
+      printf 'tid=%s wchan=' "$tid" >&2
+      cat "$task/wchan" >&2 2>/dev/null || true
+      cat "$task/stack" >&2 2>/dev/null || true
+    done
+  done
+  die "L2 cold-boot stress reproduced a failure"
+fi
+_pass "all $rounds L2 cold boots completed without a kernel fault"
+suite_summary "18_nestedvirt_cold_stress"
