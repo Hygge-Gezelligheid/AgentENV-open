@@ -77,6 +77,7 @@ read_tick() {
     dump_inner_log
     die "$1: $output"
   fi
+  [[ -n "$output" ]] || return 1
   read -r boot_id tick <<< "$output"
 }
 
