@@ -51,6 +51,8 @@ jobs:
 
   e2e-tests:
     name: e2e-tests (${{ matrix.e2e_name }})
+    env:
+      E2E_NESTEDVIRT_IMAGE: ${{ vars.E2E_NESTEDVIRT_IMAGE }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

@@ -62,7 +62,12 @@ check_apf_policy() {
 }
 
 dump_inner_log() {
-  guest 'tail -n 80 /run/nestedvirt-probe/inner.log' 5 >&2 || true
+  guest 'if pid=$(cat /run/nestedvirt-probe/inner.pid) && [ -r "/proc/$pid/status" ]; then
+      sed -n "/^State:/s/^/QEMU /p" "/proc/$pid/status"
+    else
+      echo "QEMU process unavailable (PID ${pid:-unknown})"
+    fi
+    tail -n 80 /run/nestedvirt-probe/inner.log' 5 >&2 || true
 }
 
 read_tick() {
@@ -94,18 +99,23 @@ check_progress() {
     fi
   done
   dump_inner_log
-  die "${phase}: inner guest stopped advancing"
+  [[ -n "$first" ]] || die "${phase}: could not read L2 state from L1"
+  die "${phase}: inner guest stopped advancing from tick $first"
 }
 
-# Use the ordinary Ubuntu E2E image; install the L2 workload in this test's L1.
+# Allow deployments to use the prepared fixture once it is available in their registry.
+fixture_image=${E2E_NESTEDVIRT_IMAGE:-}
+if [[ -n "$fixture_image" && ! "$fixture_image" =~ @sha256:[0-9a-f]{64}$ ]]; then
+  die "E2E_NESTEDVIRT_IMAGE must include its manifest digest (@sha256:...)"
+fi
 api_post /v3/templates "$(jq -nc --arg name "e2e-nested-$(date +%s%N)" '{name:$name,cpuCount:2,memoryMB:1024}')"
 expect_status 202 "create nested template"
 template_id=$(jq -er '.templateID' <<< "$HTTP_BODY")
 build_id=$(jq -er '.buildID' <<< "$HTTP_BODY")
 track_template "$template_id"
-api_post "/v2/templates/${template_id}/builds/${build_id}" "$(jq -nc --arg image "$E2E_TEMPLATE_USER_IMAGE" '{fromImage:$image}')"
+api_post "/v2/templates/${template_id}/builds/${build_id}" "$(jq -nc --arg image "${fixture_image:-$E2E_TEMPLATE_USER_IMAGE}" '{fromImage:$image}')"
 expect_status 202 "build nested template"
-wait_for_template_build "$template_id" 180 "$build_id" || die "Nested template build timed out"
+wait_for_template_build "$template_id" 180 "$build_id" || die "Nested template build did not become ready"
 sandbox_id=$(create_sandbox "$template_id" 900); _sync_http
 expect_status 201 "create L1 sandbox"
 track_sandbox "$sandbox_id"
@@ -114,22 +124,20 @@ wait_guest
 guest 'test "$(uname -m)" = x86_64; test -c /dev/kvm'
 _pass "L1 exposes /dev/kvm"
 
-# Guest payload: prepare and launch L2 in L1; inner-init runs inside L2.
+# Keep the QEMU invocation and state checks under the control of the test checkout.
 cat > "$work/nestedvirt-guest.sh" <<'NESTEDVIRT_GUEST'
 #!/bin/sh
 # Copyright 2026 AgentENV contributors.
 # SPDX-License-Identifier: Apache-2.0
 set -eu
-mode=${1:?Expected prepare, read-state, inner-init or start-inner}
+mode=${1:?Expected prepare, read-state or start-inner}
 if [ "$#" -gt 0 ]; then shift; fi
 case "$mode" in
     prepare)
-        test "$(uname -m)" = x86_64
-        test -c /dev/kvm
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update
+        apt-get -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update
         # Use the security pocket for the inner kernel and its matching modules.
-        apt-get install -y --no-install-recommends qemu-system-x86 busybox-static cpio linux-image-virtual/noble-security cpuid
+        apt-get -o Acquire::Retries=2 install -y --no-install-recommends qemu-system-x86 busybox-static cpio linux-image-virtual/noble-security cpuid
         root=$(mktemp -d)
         trap 'rm -rf "$root"' EXIT
         mkdir -p "$root/bin" "$root/dev" "$root/proc" "$root/sys"
@@ -137,13 +145,9 @@ case "$mode" in
         mknod "$root/dev/null" c 1 3
         cp /bin/busybox "$root/bin/busybox"
         ln -s busybox "$root/bin/sh"
-        cp /nestedvirt-guest "$root/nestedvirt-guest"
-        printf '#!/bin/sh\nexec /bin/sh /nestedvirt-guest inner-init\n' > "$root/init"
-        chmod +x "$root/init"
+        install -m 0755 /nestedvirt-init "$root/init"
         (cd "$root"; find . -print | cpio -o -H newc) > /inner.cpio
-        kernel=$(find /boot -name 'vmlinuz-*' | sort | tail -n 1)
-        test -n "$kernel"
-        cp "$kernel" /inner-bzImage
+        install -m 0644 /boot/vmlinuz /inner-bzImage
         ;;
     read-state)
         # Parse serial output in L1 so polling does not transfer the growing boot log.
@@ -159,17 +163,6 @@ case "$mode" in
             END { if (!failed && length(boot) == 36 && boot ~ /^[0-9a-f-]+$/ && tick != "") print boot, tick }
         ' /run/nestedvirt-probe/inner.log
         ;;
-    inner-init)
-        /bin/busybox mount -t proc proc /proc
-        /bin/busybox mount -t sysfs sysfs /sys
-        echo "INNER_BOOT_ID=$(/bin/busybox cat /proc/sys/kernel/random/boot_id)"
-        n=0
-        while true; do
-            echo "INNER_TICK=$n"
-            n=$((n+1))
-            /bin/busybox sleep 1
-        done
-        ;;
     start-inner)
         /bin/busybox ip link set lo up
         # Provide the RTC for boot probing. Limit kernel output on the emulated UART
@@ -184,7 +177,12 @@ case "$mode" in
 esac
 NESTEDVIRT_GUEST
 payload=$(base64 < "$work/nestedvirt-guest.sh" | tr -d '\n')
-guest "printf '%s' '$payload' | base64 -d > /nestedvirt-guest; chmod +x /nestedvirt-guest; /nestedvirt-guest prepare" 600
+guest "printf '%s' '$payload' | base64 -d > /nestedvirt-guest; chmod +x /nestedvirt-guest"
+if [[ -z "$fixture_image" ]]; then
+  init_payload=$(base64 < "$repo_root/images/nestedvirt/init" | tr -d '\n')
+  guest "printf '%s' '$init_payload' | base64 -d > /nestedvirt-init; /nestedvirt-guest prepare" 600
+fi
+guest 'test -s /inner-bzImage; test -s /inner.cpio'
 check_apf_policy
 guest 'mkdir -p /run/nestedvirt-probe; nohup /nestedvirt-guest start-inner > /run/nestedvirt-probe/inner.log 2>&1 < /dev/null & echo $! > /run/nestedvirt-probe/inner.pid'
 # Bound cold boot by elapsed time. Inspect once more after the final sleep.

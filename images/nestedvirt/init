@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+echo "INNER_BOOT_ID=$(/bin/busybox cat /proc/sys/kernel/random/boot_id)"
+n=0
+while true; do
+    echo "INNER_TICK=$n"
+    n=$((n + 1))
+    /bin/busybox sleep 1
+done
