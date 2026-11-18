@@ -62,7 +62,11 @@ check_apf_policy() {
 }
 
 dump_inner_log() {
-  guest 'tail -n 80 /run/nestedvirt-probe/inner.log' 5 >&2 || true
+  guest 'log=/run/nestedvirt-probe/inner.log
+    echo "--- L2 serial: first 80 lines ---"
+    head -n 80 "$log"
+    echo "--- L2 serial: last 80 lines ---"
+    tail -n 80 "$log"' 5 >&2 || true
 }
 
 read_tick() {
@@ -154,18 +158,21 @@ case "$mode" in
                 failed = 1
                 exit
             }
-            /^INNER_BOOT_ID=/ { boot = $0; sub(/^INNER_BOOT_ID=/, "", boot); tick = "" }
-            /^INNER_TICK=[0-9]+$/ { tick = $0; sub(/^INNER_TICK=/, "", tick) }
-            END { if (!failed && length(boot) == 36 && boot ~ /^[0-9a-f-]+$/ && tick != "") print boot, tick }
+            /^INNER_BOOT_ID=[0-9a-f-]+ INNER_TICK=[0-9]+$/ {
+                sub(/^INNER_BOOT_ID=/, "", $1)
+                sub(/^INNER_TICK=/, "", $2)
+                if (length($1) == 36) { boot = $1; tick = $2 }
+            }
+            END { if (!failed && boot != "") print boot, tick }
         ' /run/nestedvirt-probe/inner.log
         ;;
     inner-init)
         /bin/busybox mount -t proc proc /proc
         /bin/busybox mount -t sysfs sysfs /sys
-        echo "INNER_BOOT_ID=$(/bin/busybox cat /proc/sys/kernel/random/boot_id)"
+        boot_id=$(/bin/busybox cat /proc/sys/kernel/random/boot_id)
         n=0
         while true; do
-            echo "INNER_TICK=$n"
+            printf 'INNER_BOOT_ID=%s INNER_TICK=%s\n' "$boot_id" "$n"
             n=$((n+1))
             /bin/busybox sleep 1
         done
