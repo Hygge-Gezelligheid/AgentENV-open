@@ -172,12 +172,13 @@ case "$mode" in
         ;;
     start-inner)
         /bin/busybox ip link set lo up
-        # Provide the RTC that the inner kernel probes during boot.
+        # Provide the RTC for boot probing. Limit kernel output on the emulated UART
+        # to warnings and errors so serial writes do not delay the first heartbeat.
         exec /usr/bin/qemu-system-x86_64 -machine microvm,accel=kvm,rtc=on -cpu host \
             -m 128 -smp 1 -nodefaults -no-reboot -nographic -serial stdio \
             -qmp tcp:127.0.0.1:4444,server=on,wait=off \
             -kernel /inner-bzImage -initrd /inner.cpio \
-            -append 'console=ttyS0 panic=1 rdinit=/init' "$@"
+            -append 'console=ttyS0 loglevel=5 panic=1 rdinit=/init' "$@"
         ;;
     *) echo "Unknown guest operation: $mode" >&2; exit 2 ;;
 esac
