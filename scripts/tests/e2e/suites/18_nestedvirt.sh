@@ -62,7 +62,7 @@ check_apf_policy() {
 }
 
 dump_inner_log() {
-  guest 'tail -n 80 /run/nestedvirt-probe/inner.log' 5 >&2 || true
+  guest 'tail -n 80 /run/nestedvirt-probe/early.log /run/nestedvirt-probe/inner.log' 5 >&2 || true
 }
 
 read_tick() {
@@ -146,7 +146,7 @@ case "$mode" in
         cp "$kernel" /inner-bzImage
         ;;
     read-state)
-        # Parse serial output in L1 so polling does not transfer the growing boot log.
+        # Detect faults from either console. Only the regular console carries the workload heartbeat.
         awk '
             { sub(/\r$/, "") }
             /^\[[[:space:]]*[0-9.]+\] / && /Kernel panic - not syncing:|BUG: kernel|general protection fault|Oops:|invalid opcode:/ {
@@ -154,10 +154,11 @@ case "$mode" in
                 failed = 1
                 exit
             }
+            FILENAME == ARGV[1] { next }
             /^INNER_BOOT_ID=/ { boot = $0; sub(/^INNER_BOOT_ID=/, "", boot); tick = "" }
             /^INNER_TICK=[0-9]+$/ { tick = $0; sub(/^INNER_TICK=/, "", tick) }
             END { if (!failed && length(boot) == 36 && boot ~ /^[0-9a-f-]+$/ && tick != "") print boot, tick }
-        ' /run/nestedvirt-probe/inner.log
+        ' /run/nestedvirt-probe/early.log /run/nestedvirt-probe/inner.log
         ;;
     inner-init)
         /bin/busybox mount -t proc proc /proc
@@ -172,13 +173,16 @@ case "$mode" in
         ;;
     start-inner)
         /bin/busybox ip link set lo up
-        # Provide the RTC for boot probing. Limit kernel output on the emulated UART
-        # to warnings and errors so serial writes do not delay the first heartbeat.
+        # Capture early kernel failures on the UART. Use virtio for the regular
+        # console and workload heartbeat across snapshot restore and resume.
         exec /usr/bin/qemu-system-x86_64 -machine microvm,accel=kvm,rtc=on -cpu host \
-            -m 128 -smp 1 -nodefaults -no-reboot -nographic -serial stdio \
+            -m 128 -smp 1 -nodefaults -no-reboot -display none -monitor none \
+            -serial file:/run/nestedvirt-probe/early.log \
+            -chardev stdio,id=console,signal=off -device virtio-serial-device,id=consolebus \
+            -device virtconsole,bus=consolebus.0,chardev=console \
             -qmp tcp:127.0.0.1:4444,server=on,wait=off \
             -kernel /inner-bzImage -initrd /inner.cpio \
-            -append 'console=ttyS0 loglevel=5 panic=1 rdinit=/init' "$@"
+            -append 'earlycon=uart8250,io,0x3f8,115200 console=hvc0 loglevel=5 panic=1 rdinit=/init' "$@"
         ;;
     *) echo "Unknown guest operation: $mode" >&2; exit 2 ;;
 esac
@@ -186,7 +190,7 @@ NESTEDVIRT_GUEST
 payload=$(base64 < "$work/nestedvirt-guest.sh" | tr -d '\n')
 guest "printf '%s' '$payload' | base64 -d > /nestedvirt-guest; chmod +x /nestedvirt-guest; /nestedvirt-guest prepare" 600
 check_apf_policy
-guest 'mkdir -p /run/nestedvirt-probe; nohup /nestedvirt-guest start-inner > /run/nestedvirt-probe/inner.log 2>&1 < /dev/null & echo $! > /run/nestedvirt-probe/inner.pid'
+guest 'mkdir -p /run/nestedvirt-probe; : > /run/nestedvirt-probe/early.log; nohup /nestedvirt-guest start-inner > /run/nestedvirt-probe/inner.log 2>&1 < /dev/null & echo $! > /run/nestedvirt-probe/inner.pid'
 # Bound cold boot by elapsed time. Inspect once more after the final sleep.
 boot_deadline=$((SECONDS + 180))
 while true; do
