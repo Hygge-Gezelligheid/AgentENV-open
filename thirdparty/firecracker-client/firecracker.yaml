@@ -853,6 +853,35 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /vm/dirty-memory-ranges/clear:
+    put:
+      summary: Clears committed dirty memory records while paused.
+      description: >-
+        Requires a started, paused VM and an empty JSON object. Clear only
+        after retaining a complete memory baseline. Activated virtio queue
+        pages remain dirty. With tracking disabled this is a no-op. A dirty
+        log failure may partially clear records; stop the affected instance.
+      operationId: clearDirtyMemory
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            additionalProperties: false
+            maxProperties: 0
+      responses:
+        204:
+          description: Dirty records cleared; VM remains paused.
+        400:
+          description: Invalid request, precondition failure or dirty log error.
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /vm/dirty-memory-ranges:
     get:
       summary: Returns dirty guest memory ranges.
