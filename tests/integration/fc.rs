@@ -1423,6 +1423,98 @@ async fn inplace_pause_resume_then_snapshot_and_fork_preserve_committed_memory()
             SnapshotPlacement::Distributed,
         )
         .await?;
+
+        // Run a second pause + CLEAR cycle, then exercise the real `SandboxBackend::fork()`
+        // path and verify both committed memory preservation and parent/child write isolation.
+        run_guest_sh(
+            &mut sandbox,
+            "echo before-fork > /dev/shm/ramtest/fork_base.txt",
+        )
+        .await?;
+        let _paused_before_fork = SandboxBackend::pause(&mut sandbox).await?;
+        sandbox.resume().await?;
+
+        let fork_root = tempfile::tempdir()?;
+        let fork_child_id = SandboxId::new();
+        let fork_child_dir = fork_root.path().join(fork_child_id.to_string());
+        fs::create_dir(&fork_child_dir)?;
+        let mut forked_children = SandboxBackend::fork(
+            &mut sandbox,
+            &[agentenv::sandbox::SandboxForkSpec {
+                sandbox_id: fork_child_id,
+                storage_root: fork_child_dir.clone(),
+                envd_access_token: None,
+                extra_drives: Vec::new(),
+                replace_drive_ids: Vec::new(),
+            }],
+        )
+        .await?;
+        assert_eq!(forked_children.len(), 1);
+        let mut fork_child = forked_children.pop().unwrap()?;
+
+        // Mutate parent RAM after fork; forked child must not see parent's new writes.
+        let child_stage: Result<serde_json::Value> = async {
+            run_guest_sh(
+                &mut sandbox,
+                "echo parent-only > /dev/shm/ramtest/isolation.txt && \
+                 dd if=/dev/zero of=/dev/shm/ramtest/before_clear.bin bs=1M count=1 conv=notrunc 2>/dev/null",
+            )
+            .await?;
+            let paused_child = fork_child.pause().await?;
+            paused_child.encode()
+        }
+        .await;
+        let fork_child_stop = fork_child.stop().await;
+        drop(fork_child);
+        let child_encoded = child_stage?;
+        fork_child_stop?;
+        let child_state = FirecrackerPausedState::decode(child_encoded)?;
+        let mut resumed_child = FirecrackerSandbox::from_paused_state(
+            &child_state,
+            fork_child_id,
+            None,
+            &fork_child_dir,
+        )?;
+        let child_verify: Result<(String, String, String, String)> = async {
+            resumed_child.start().await?;
+            let child_before =
+                run_guest_sh(&mut resumed_child, "sha256sum /dev/shm/ramtest/before_clear.bin")
+                    .await?;
+            let child_after =
+                run_guest_sh(&mut resumed_child, "sha256sum /dev/shm/ramtest/after_clear.bin")
+                    .await?;
+            let child_fork_base =
+                run_guest_sh(&mut resumed_child, "cat /dev/shm/ramtest/fork_base.txt").await?;
+            let child_iso = run_guest_sh(
+                &mut resumed_child,
+                "test ! -e /dev/shm/ramtest/isolation.txt && echo child-only > /dev/shm/ramtest/isolation.txt && cat /dev/shm/ramtest/isolation.txt",
+            )
+            .await?;
+            Ok((child_before, child_after, child_fork_base, child_iso))
+        }
+        .await;
+        let child_stop = resumed_child.stop().await;
+        let (child_before, child_after, child_fork_base, child_iso) = child_verify?;
+        child_stop?;
+
+        assert_eq!(
+            child_before, expected_before,
+            "forked child must preserve pre-CLEAR RAM and stay isolated from parent overwrites"
+        );
+        assert_eq!(
+            child_after, expected_after,
+            "forked child must preserve post-CLEAR RAM"
+        );
+        assert_eq!(child_fork_base, "before-fork");
+        assert_eq!(child_iso, "child-only");
+
+        let parent_iso =
+            run_guest_sh(&mut sandbox, "cat /dev/shm/ramtest/isolation.txt").await?;
+        assert_eq!(
+            parent_iso, "parent-only",
+            "parent RAM must stay isolated from forked child writes"
+        );
+
         Ok((local_snap, dist_snap, expected_before, expected_after))
     }
     .await;
