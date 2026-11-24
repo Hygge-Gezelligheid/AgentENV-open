@@ -1189,3 +1189,341 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
     sandbox.stop().await?;
     Ok(())
 }
+
+async fn query_firecracker_dirty_bytes(socket_path: &Path) -> Result<u64> {
+    use http_body_util::{BodyExt, Empty};
+    use hyper::body::Bytes;
+    use hyper::client::conn::http1;
+    use hyper::{Method, Request};
+    use hyper_util::rt::TokioIo;
+    use tokio::net::UnixStream;
+
+    let stream = UnixStream::connect(socket_path)
+        .await
+        .with_context(|| format!("connect firecracker socket {}", socket_path.display()))?;
+    let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await?;
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/vm/dirty-memory-ranges")
+        .header(hyper::header::HOST, "localhost")
+        .header(hyper::header::ACCEPT, "application/json")
+        .body(Empty::<Bytes>::new())?;
+    let response = sender.send_request(request).await?;
+    let status = response.status();
+    let body = response.collect().await?.to_bytes();
+    conn_task.abort();
+    if !status.is_success() {
+        bail!(
+            "GET /vm/dirty-memory-ranges returned {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&body)?;
+    let total = parsed["ranges"]
+        .as_array()
+        .context("dirty ranges array missing")?
+        .iter()
+        .map(|range| range["length"].as_u64().unwrap_or(0))
+        .sum();
+    Ok(total)
+}
+
+async fn run_guest_sh(sandbox: &mut FirecrackerSandbox, script: &str) -> Result<String> {
+    let output = sandbox.run_command("sh", &["-c", script]).await?;
+    if output.exit_code != 0 {
+        bail!(
+            "guest script failed (exit {}): stdout='{}' stderr='{}'",
+            output.exit_code,
+            output.stdout.trim(),
+            output.stderr.trim()
+        );
+    }
+    Ok(output.stdout.trim().to_string())
+}
+
+async fn prepare_guest_tmpfs_dir(sandbox: &mut FirecrackerSandbox) -> Result<()> {
+    // Ensure `/dev/shm/ramtest` is backed by tmpfs (guest RAM, never virtio-blk).
+    let fstype = run_guest_sh(
+        sandbox,
+        "mkdir -p /dev/shm/ramtest && stat -f -c %T /dev/shm/ramtest",
+    )
+    .await?;
+    if fstype != "tmpfs" {
+        bail!("expected /dev/shm/ramtest to be tmpfs, got '{fstype}'");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn inplace_pause_resume_clears_dirty_memory_and_preserves_zero_overwrites() -> Result<()> {
+    common::setup().await;
+    let mut config = common::default_sandbox_config()?;
+    config.common.track_dirty_pages = true;
+    config.mem_size_mib = 512;
+
+    let storage_root = tempfile::tempdir()?;
+    let id = SandboxId::new();
+    let mut sandbox = FirecrackerSandbox::new(config, id, Some(storage_root.path()))?;
+
+    let phase1: Result<(serde_json::Value, String, String)> = async {
+        sandbox.start().await?;
+        let socket_path = sandbox
+            .work_rootfs_path()
+            .with_file_name("firecracker.socket");
+        prepare_guest_tmpfs_dir(&mut sandbox).await?;
+        run_guest_sh(
+            &mut sandbox,
+            "dd if=/dev/zero bs=1M count=64 2>/dev/null | tr '\\0' 'Z' > /dev/shm/ramtest/page_a.bin",
+        )
+        .await?;
+
+        // Round 1: pause saves page_a (64 MiB+) into the single sparse upper; resume clears dirty log.
+        let paused_r1 = SandboxBackend::pause(&mut sandbox).await?;
+        let dirty_r1 = query_firecracker_dirty_bytes(&socket_path).await?;
+        assert!(
+            dirty_r1 >= 64 * 1024 * 1024,
+            "round 1 should include >= 64 MiB dirty RAM, got {dirty_r1}"
+        );
+        let mem_cfg = paused_r1
+            .downcast_ref::<FirecrackerPausedState>()
+            .unwrap()
+            .snapshot_config()
+            .mem_overlaybd_config
+            .image_config_path
+            .clone();
+        assert_eq!(lower_file_paths_from_image_config(&mem_cfg)?.len(), 0);
+        sandbox.resume().await?;
+
+        // Round 2: modify only 2 MiB (page_b). After CLEAR, dirty bytes must drop dramatically.
+        run_guest_sh(
+            &mut sandbox,
+            "dd if=/dev/zero bs=1M count=2 2>/dev/null | tr '\\0' 'B' > /dev/shm/ramtest/page_b.bin",
+        )
+        .await?;
+        let paused_r2 = SandboxBackend::pause(&mut sandbox).await?;
+        let dirty_r2 = query_firecracker_dirty_bytes(&socket_path).await?;
+        assert!(
+            dirty_r2 < 32 * 1024 * 1024,
+            "round 2 dirty bytes ({dirty_r2}) should be much smaller than round 1 ({dirty_r1}) after CLEAR"
+        );
+        assert_eq!(
+            lower_file_paths_from_image_config(
+                &paused_r2
+                    .downcast_ref::<FirecrackerPausedState>()
+                    .unwrap()
+                    .snapshot_config()
+                    .mem_overlaybd_config
+                    .image_config_path
+            )?
+            .len(),
+            0,
+            "in-place pause/resume must not stack new immutable memory layers"
+        );
+        sandbox.resume().await?;
+
+        // Round 3: overwrite first 8 MiB of page_a with explicit zero bytes.
+        run_guest_sh(
+            &mut sandbox,
+            "dd if=/dev/zero of=/dev/shm/ramtest/page_a.bin bs=1M count=8 conv=notrunc 2>/dev/null",
+        )
+        .await?;
+        let expected_a =
+            run_guest_sh(&mut sandbox, "sha256sum /dev/shm/ramtest/page_a.bin").await?;
+        let expected_b =
+            run_guest_sh(&mut sandbox, "sha256sum /dev/shm/ramtest/page_b.bin").await?;
+
+        let paused_r3 = SandboxBackend::pause(&mut sandbox).await?;
+        let dirty_r3 = query_firecracker_dirty_bytes(&socket_path).await?;
+        assert!(
+            dirty_r3 < 32 * 1024 * 1024,
+            "round 3 zero-overwrite dirty bytes ({dirty_r3}) should remain incremental"
+        );
+        let encoded = paused_r3.encode()?;
+        Ok((encoded, expected_a, expected_b))
+    }
+    .await;
+    let stop_res = sandbox.stop().await;
+    drop(sandbox);
+    let (encoded, expected_a, expected_b) = phase1?;
+    stop_res?;
+
+    // Cold restore from the final paused state and verify all 3 rounds of RAM edits survived.
+    let state = FirecrackerPausedState::decode(encoded)?;
+    let mut restored =
+        FirecrackerSandbox::from_paused_state(&state, id, None, storage_root.path())?;
+    let verify: Result<(String, String)> = async {
+        restored.start().await?;
+        let actual_a = run_guest_sh(&mut restored, "sha256sum /dev/shm/ramtest/page_a.bin").await?;
+        let actual_b = run_guest_sh(&mut restored, "sha256sum /dev/shm/ramtest/page_b.bin").await?;
+        Ok((actual_a, actual_b))
+    }
+    .await;
+    let stop_res = restored.stop().await;
+    let (actual_a, actual_b) = verify?;
+    stop_res?;
+
+    assert_eq!(
+        actual_a, expected_a,
+        "page_a (including 8 MiB zero overwrite) must match"
+    );
+    assert_eq!(actual_b, expected_b, "page_b must match");
+    Ok(())
+}
+
+#[tokio::test]
+async fn inplace_pause_resume_then_snapshot_and_fork_preserve_committed_memory() -> Result<()> {
+    common::setup().await;
+    let mut config = common::default_sandbox_config()?;
+    config.common.track_dirty_pages = true;
+    config.mem_size_mib = 512;
+
+    let storage_root = tempfile::tempdir()?;
+    let mut sandbox = FirecrackerSandbox::new(config, SandboxId::new(), Some(storage_root.path()))?;
+
+    let captured: Result<(
+        Arc<agentenv::snapshot::Snapshot>,
+        Arc<agentenv::snapshot::Snapshot>,
+        String,
+        String,
+    )> = async {
+        sandbox.start().await?;
+        prepare_guest_tmpfs_dir(&mut sandbox).await?;
+        // Write 16 MiB into RAM, pause + in-place resume (CLEARs those 16 MiB from KVM dirty log).
+        run_guest_sh(
+            &mut sandbox,
+            "dd if=/dev/zero bs=1M count=16 2>/dev/null | tr '\\0' 'A' > /dev/shm/ramtest/before_clear.bin",
+        )
+        .await?;
+        let _paused = SandboxBackend::pause(&mut sandbox).await?;
+        sandbox.resume().await?;
+
+        // Write another 2 MiB after CLEAR, then capture both Local and Distributed snapshots.
+        run_guest_sh(
+            &mut sandbox,
+            "dd if=/dev/zero bs=1M count=2 2>/dev/null | tr '\\0' 'C' > /dev/shm/ramtest/after_clear.bin",
+        )
+        .await?;
+        let expected_before =
+            run_guest_sh(&mut sandbox, "sha256sum /dev/shm/ramtest/before_clear.bin").await?;
+        let expected_after =
+            run_guest_sh(&mut sandbox, "sha256sum /dev/shm/ramtest/after_clear.bin").await?;
+
+        let local_snap = SandboxBackend::snapshot(
+            &mut sandbox,
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Local,
+        )
+        .await?;
+        let dist_snap = SandboxBackend::snapshot(
+            &mut sandbox,
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
+        .await?;
+        Ok((local_snap, dist_snap, expected_before, expected_after))
+    }
+    .await;
+    // Stop source sandbox and delete its storage_root to prove snapshots own their retained layers.
+    let stop_res = sandbox.stop().await;
+    drop(sandbox);
+    drop(storage_root);
+    let (local_snap, dist_snap, expected_before, expected_after) = captured?;
+    stop_res?;
+
+    for (label, snap) in [("local", local_snap), ("distributed", dist_snap)] {
+        let mut child = FirecrackerSandbox::from_snapshot_files(
+            snap,
+            agentenv::sandbox::FirecrackerCommonConfig::from_global_config()
+                .expect("snapshot launch config"),
+            SandboxId::new(),
+            None,
+        )?;
+        let verify: Result<(String, String)> = async {
+            child.start().await?;
+            let actual_before =
+                run_guest_sh(&mut child, "sha256sum /dev/shm/ramtest/before_clear.bin").await?;
+            let actual_after =
+                run_guest_sh(&mut child, "sha256sum /dev/shm/ramtest/after_clear.bin").await?;
+            Ok((actual_before, actual_after))
+        }
+        .await;
+        let stop_res = child.stop().await;
+        let (actual_before, actual_after) = verify?;
+        stop_res?;
+        assert_eq!(
+            actual_before, expected_before,
+            "{label} snapshot must preserve pre-CLEAR RAM pages"
+        );
+        assert_eq!(
+            actual_after, expected_after,
+            "{label} snapshot must preserve post-CLEAR RAM pages"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn inplace_pause_resume_skips_clear_when_dirty_tracking_disabled() -> Result<()> {
+    common::setup().await;
+    let mut config = common::default_sandbox_config()?;
+    config.common.track_dirty_pages = false;
+    config.mem_size_mib = 512;
+
+    let storage_root = tempfile::tempdir()?;
+    let id = SandboxId::new();
+    let mut sandbox = FirecrackerSandbox::new(config, id, Some(storage_root.path()))?;
+
+    let phase1: Result<(serde_json::Value, String, String)> = async {
+        sandbox.start().await?;
+        prepare_guest_tmpfs_dir(&mut sandbox).await?;
+        run_guest_sh(
+            &mut sandbox,
+            "dd if=/dev/zero bs=1M count=8 2>/dev/null | tr '\\0' 'U' > /dev/shm/ramtest/untracked_a.bin",
+        )
+        .await?;
+        let _paused_r1 = SandboxBackend::pause(&mut sandbox).await?;
+        sandbox.resume().await?;
+
+        run_guest_sh(
+            &mut sandbox,
+            "dd if=/dev/zero bs=1M count=2 2>/dev/null | tr '\\0' 'V' > /dev/shm/ramtest/untracked_b.bin",
+        )
+        .await?;
+        let expected_a =
+            run_guest_sh(&mut sandbox, "sha256sum /dev/shm/ramtest/untracked_a.bin").await?;
+        let expected_b =
+            run_guest_sh(&mut sandbox, "sha256sum /dev/shm/ramtest/untracked_b.bin").await?;
+
+        let paused_r2 = SandboxBackend::pause(&mut sandbox).await?;
+        let encoded = paused_r2.encode()?;
+        Ok((encoded, expected_a, expected_b))
+    }
+    .await;
+    let stop_res = sandbox.stop().await;
+    drop(sandbox);
+    let (encoded, expected_a, expected_b) = phase1?;
+    stop_res?;
+
+    let state = FirecrackerPausedState::decode(encoded)?;
+    let mut restored =
+        FirecrackerSandbox::from_paused_state(&state, id, None, storage_root.path())?;
+    let verify: Result<(String, String)> = async {
+        restored.start().await?;
+        let actual_a =
+            run_guest_sh(&mut restored, "sha256sum /dev/shm/ramtest/untracked_a.bin").await?;
+        let actual_b =
+            run_guest_sh(&mut restored, "sha256sum /dev/shm/ramtest/untracked_b.bin").await?;
+        Ok((actual_a, actual_b))
+    }
+    .await;
+    let stop_res = restored.stop().await;
+    let (actual_a, actual_b) = verify?;
+    stop_res?;
+
+    assert_eq!(actual_a, expected_a);
+    assert_eq!(actual_b, expected_b);
+    Ok(())
+}
